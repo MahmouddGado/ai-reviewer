@@ -1,0 +1,33 @@
+name: "AI Code Reviewer"
+description: "CodeRabbit-style AI reviews on every pull request and commit, powered by Claude"
+author: "your-org"
+branding:
+  icon: "eye"
+  color: "orange"
+inputs:
+  anthropic_api_key:
+    description: "Anthropic API key (store as a secret)"
+    required: true
+  github_token:
+    description: "GitHub token with pull-requests: write and issues: write"
+    required: true
+    default: ${{ github.token }}
+  model:
+    description: "Claude model id (e.g. claude-sonnet-5, claude-opus-4-8)"
+    required: false
+    default: "claude-sonnet-5"
+  config_path:
+    description: "Path to the .aireviewer.yaml config file in the repo"
+    required: false
+    default: ".aireviewer.yaml"
+  max_files:
+    description: "Maximum number of files to review per run"
+    required: false
+    default: "50"
+  review_profile:
+    description: "Default review profile: quiet | chill | assertive"
+    required: false
+    default: "chill"
+runs:
+  using: "node20"
+  main: "dist/index.js"

@@ -1,0 +1,5 @@
+node_modules/
+lib/
+*.log
+.DS_Store
+# NOTE: dist/ is intentionally committed — GitHub Actions runs the bundled output.

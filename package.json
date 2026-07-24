@@ -1,0 +1,28 @@
+{
+  "name": "ai-reviewer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CodeRabbit-style AI PR reviewer powered by Claude, packaged as a GitHub Action",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "ncc build src/main.ts -o dist --source-map --license licenses.txt",
+    "typecheck": "tsc --noEmit",
+    "package": "npm run build"
+  },
+  "keywords": ["github-action", "code-review", "ai", "claude", "anthropic"],
+  "license": "MIT",
+  "dependencies": {
+    "@actions/core": "^1.11.1",
+    "@actions/github": "^6.0.0",
+    "@anthropic-ai/sdk": "^0.32.1",
+    "minimatch": "^10.0.1",
+    "parse-diff": "^0.11.1",
+    "yaml": "^2.6.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@vercel/ncc": "^0.38.3",
+    "typescript": "^5.7.2"
+  }
+}
