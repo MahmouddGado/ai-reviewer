@@ -1,8 +1,12 @@
 # 🐰 AI Reviewer
 
-A CodeRabbit-style AI code reviewer packaged as a GitHub Action, powered by Claude. It reviews every
-pull request and **re-reviews incrementally on each new commit**, posting a walkthrough summary plus
-inline, one-click committable suggestions.
+A CodeRabbit-style AI code reviewer packaged as a GitHub Action, powered by **z.ai GLM 5.2** (via its
+Anthropic-compatible endpoint). It reviews every pull request and **re-reviews incrementally on each
+new commit**, posting a walkthrough summary plus inline, one-click committable suggestions.
+
+> **Model backend:** Uses the `@anthropic-ai/sdk` pointed at `https://api.z.ai/api/anthropic`, so
+> GLM models work with no code changes. Swap `model:` (e.g. `glm-4.6`) and `base_url:` to use any
+> Anthropic-compatible provider — including Anthropic itself (`model: claude-sonnet-5`, drop `base_url`).
 
 ## Features
 
@@ -16,7 +20,7 @@ inline, one-click committable suggestions.
 
 ## Quick start
 
-1. Add an `ANTHROPIC_API_KEY` secret to the repo (or org).
+1. Add a `ZAI_API_KEY` secret to the repo (or org) — get one at https://z.ai.
 2. Copy `examples/ai-review.yml` to `.github/workflows/ai-review.yml`.
 3. (Optional) Copy `examples/.aireviewer.yaml` to the repo root.
 4. Open a PR — the review appears within a minute.

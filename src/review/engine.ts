@@ -13,8 +13,11 @@ export class ReviewEngine {
   constructor(
     apiKey: string,
     private model: string,
+    baseURL?: string,
   ) {
-    this.client = new Anthropic({ apiKey });
+    // baseURL points the Anthropic SDK at z.ai's Anthropic-compatible endpoint
+    // (https://api.z.ai/api/anthropic) so GLM models work with no code changes.
+    this.client = new Anthropic({ apiKey, ...(baseURL ? { baseURL } : {}) });
   }
 
   async review(system: string, user: string): Promise<ReviewResult> {

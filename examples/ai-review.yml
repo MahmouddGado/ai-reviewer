@@ -23,6 +23,7 @@ jobs:
     steps:
       - uses: your-org/ai-reviewer@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          api_key: ${{ secrets.ZAI_API_KEY }}          # z.ai API key
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          model: claude-sonnet-5
+          model: glm-5.2                                # z.ai GLM 5.2
+          # base_url defaults to https://api.z.ai/api/anthropic

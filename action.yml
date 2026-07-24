@@ -5,17 +5,21 @@ branding:
   icon: "eye"
   color: "orange"
 inputs:
-  anthropic_api_key:
-    description: "Anthropic API key (store as a secret)"
+  api_key:
+    description: "z.ai API key (store as a secret). Legacy alias: anthropic_api_key."
     required: true
+  base_url:
+    description: "Anthropic-compatible API base URL. Defaults to z.ai's endpoint."
+    required: false
+    default: "https://api.z.ai/api/anthropic"
   github_token:
     description: "GitHub token with pull-requests: write and issues: write"
     required: true
     default: ${{ github.token }}
   model:
-    description: "Claude model id (e.g. claude-sonnet-5, claude-opus-4-8)"
+    description: "Model id (e.g. glm-5.2, glm-4.6). z.ai GLM via the Anthropic-compatible endpoint."
     required: false
-    default: "claude-sonnet-5"
+    default: "glm-5.2"
   config_path:
     description: "Path to the .aireviewer.yaml config file in the repo"
     required: false

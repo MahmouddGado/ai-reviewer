@@ -11,9 +11,14 @@ import { getPrDetails } from "./review/context";
 
 async function run(): Promise<void> {
   try {
-    const apiKey = core.getInput("anthropic_api_key", { required: true });
+    // Accept `api_key` (preferred) or legacy `anthropic_api_key`.
+    const apiKey =
+      core.getInput("api_key") || core.getInput("anthropic_api_key");
+    if (!apiKey) throw new Error("Input required and not supplied: api_key");
     const token = core.getInput("github_token", { required: true });
-    const model = core.getInput("model") || "claude-sonnet-5";
+    const model = core.getInput("model") || "glm-5.2";
+    const baseUrl =
+      core.getInput("base_url") || "https://api.z.ai/api/anthropic";
     const configPath = core.getInput("config_path") || ".aireviewer.yaml";
 
     const overrides: Partial<Config> = {};
@@ -27,7 +32,7 @@ async function run(): Promise<void> {
     const octokit = makeOctokit(token);
     const ctx = github.context;
     const repo: Repo = { owner: ctx.repo.owner, repo: ctx.repo.repo };
-    const engine = new ReviewEngine(apiKey, model);
+    const engine = new ReviewEngine(apiKey, model, baseUrl);
 
     const pull_number = await resolvePrNumber(octokit, repo, ctx);
     if (!pull_number) {
