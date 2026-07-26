@@ -9,8 +9,12 @@ import {
 
 const TOOL_NAME = "submit_review";
 
-/** Dense finding bodies plus observations plus the assessment outgrow 8k fast. */
-const MAX_TOKENS = 16000;
+/**
+ * Dense finding bodies plus observations plus the assessment outgrow 8k fast,
+ * and a batch of large files can carry dozens of findings. Overridable via the
+ * `max_output_tokens` input for models with a smaller ceiling.
+ */
+const DEFAULT_MAX_TOKENS = 32000;
 
 export interface CallUsage {
   input: number;
@@ -25,14 +29,18 @@ export interface EngineResult {
 
 export class ReviewEngine {
   private client: Anthropic;
+  private maxTokens: number;
   constructor(
     apiKey: string,
     public readonly model: string,
     baseURL?: string,
+    maxTokens?: number,
   ) {
     // baseURL points the Anthropic SDK at z.ai's Anthropic-compatible endpoint
     // (https://api.z.ai/api/anthropic) so GLM models work with no code changes.
     this.client = new Anthropic({ apiKey, ...(baseURL ? { baseURL } : {}) });
+    this.maxTokens =
+      maxTokens && maxTokens > 0 ? maxTokens : DEFAULT_MAX_TOKENS;
   }
 
   async review(system: string, user: string): Promise<EngineResult> {
@@ -77,7 +85,7 @@ export class ReviewEngine {
   ): Promise<EngineResult> {
     const response = await this.client.messages.create({
       model: this.model,
-      max_tokens: MAX_TOKENS,
+      max_tokens: this.maxTokens,
       system,
       tools: [
         {
@@ -95,7 +103,7 @@ export class ReviewEngine {
 
     if (response.stop_reason === "max_tokens") {
       core.warning(
-        `Model hit the ${MAX_TOKENS}-token output cap; the review may be incomplete. Consider lowering max_files or splitting the PR.`,
+        `Model hit the ${this.maxTokens}-token output cap; this batch's review may be incomplete. Consider lowering batch_chars so each request carries fewer files.`,
       );
     }
 

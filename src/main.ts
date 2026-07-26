@@ -21,9 +21,18 @@ async function run(): Promise<void> {
       core.getInput("base_url") || "https://api.z.ai/api/anthropic";
     const configPath = core.getInput("config_path") || ".aireviewer.yaml";
 
+    // An unset input is "", which must stay undefined so .aireviewer.yaml wins.
+    // Note Number("") === 0, and 0 is a meaningful max_files, so the emptiness
+    // check has to come before the numeric one.
     const overrides: Partial<Config> = {};
-    const maxFiles = Number(core.getInput("max_files"));
-    if (Number.isFinite(maxFiles) && maxFiles > 0) overrides.max_files = maxFiles;
+    const maxFiles = intInput("max_files");
+    if (maxFiles !== undefined && maxFiles >= 0) overrides.max_files = maxFiles;
+    const batchChars = intInput("batch_chars");
+    if (batchChars !== undefined && batchChars > 0) {
+      overrides.batch_chars = batchChars;
+    }
+    const reviewGenerated = core.getInput("review_generated").trim();
+    if (reviewGenerated) overrides.review_generated = reviewGenerated === "true";
     const profile = core.getInput("review_profile");
     if (profile === "quiet" || profile === "chill" || profile === "assertive") {
       overrides.profile = profile;
@@ -32,7 +41,12 @@ async function run(): Promise<void> {
     const octokit = makeOctokit(token);
     const ctx = github.context;
     const repo: Repo = { owner: ctx.repo.owner, repo: ctx.repo.repo };
-    const engine = new ReviewEngine(apiKey, model, baseUrl);
+    const engine = new ReviewEngine(
+      apiKey,
+      model,
+      baseUrl,
+      intInput("max_output_tokens"),
+    );
 
     const pull_number = await resolvePrNumber(octokit, repo, ctx);
     if (!pull_number) {
@@ -134,6 +148,18 @@ async function onPullRequest(
     forceFull,
     summaryOnly: false,
   });
+}
+
+/** Read an integer input, returning undefined when it is absent or unparseable. */
+function intInput(name: string): number | undefined {
+  const raw = core.getInput(name).trim();
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    core.warning(`Ignoring non-numeric ${name}: '${raw}'.`);
+    return undefined;
+  }
+  return Math.trunc(n);
 }
 
 /** Determine the PR number from whichever event triggered the run. */

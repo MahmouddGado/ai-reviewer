@@ -96,11 +96,12 @@ event → router → orchestrator:
   1. load .aireviewer.yaml (from PR head, via API — no checkout needed)
   2. resolve scope: full (opened) vs incremental (synchronize → lastReviewedSha...head)
   3. fetch diff, parse hunks → commentable line set (prevents 422s)
-  4. select files (path filters, max_files cap), recording why each was dropped
-  5. model review (tool-use structured output) → findings + observations + assessment
-  6. verification pass (drop false positives)
-  7. post inline comments (deduped by a hidden per-finding id)
-  8. merge into the running totals, then upsert the sticky summary comment
+  4. select files (path filters, optional max_files cap), recording why each was dropped
+  5. split into batches of <= batch_chars so an unlimited file count still fits a request
+  6. model review per batch (tool-use structured output) → findings + observations + assessment
+  7. verification pass per batch (drop false positives)
+  8. post inline comments (deduped by a hidden per-finding id)
+  9. merge into the running totals, then upsert the sticky summary comment
 ```
 
 ### Staying accurate across commits

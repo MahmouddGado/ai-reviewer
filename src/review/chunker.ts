@@ -54,7 +54,10 @@ export function selectFiles(
       dropped.push({ path: f.path, reason: "binary" });
       return false;
     }
-    if (ALWAYS_IGNORE.some((g) => minimatch(f.path, g))) {
+    if (
+      !config.review_generated &&
+      ALWAYS_IGNORE.some((g) => minimatch(f.path, g))
+    ) {
       dropped.push({ path: f.path, reason: "generated" });
       return false;
     }
@@ -69,18 +72,23 @@ export function selectFiles(
     return true;
   });
 
-  // Largest changes first, so if we hit the cap we review the most substantial files.
+  // Largest changes first, so if a cap IS set we review the most substantial files.
   kept.sort((a, b) => b.additions + b.deletions - (a.additions + a.deletions));
 
-  const files = kept.slice(0, config.max_files);
-  for (const f of kept.slice(config.max_files)) {
-    dropped.push({ path: f.path, reason: "cap" });
+  // max_files: 0 means no cap — every changed file is reviewed, batched across
+  // as many model calls as it takes.
+  const unlimited = config.max_files === 0;
+  const files = unlimited ? kept : kept.slice(0, config.max_files);
+  if (!unlimited) {
+    for (const f of kept.slice(config.max_files)) {
+      dropped.push({ path: f.path, reason: "cap" });
+    }
   }
 
   const skippedByCap = kept.length - files.length;
   if (skippedByCap > 0) {
     core.warning(
-      `${skippedByCap} file(s) exceeded max_files=${config.max_files} and were not reviewed.`,
+      `${skippedByCap} file(s) exceeded max_files=${config.max_files} and were not reviewed. Set max_files: 0 to review everything.`,
     );
   }
 

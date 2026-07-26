@@ -11,6 +11,7 @@ import {
 import { getLinkedIssues, getPrDetails, PrDetails } from "./context";
 import { resolveScope } from "./scope";
 import { selectFiles } from "./chunker";
+import { planBatches } from "./batch";
 import { ReviewEngine } from "./engine";
 import {
   buildSystemPrompt,
@@ -86,46 +87,88 @@ export async function runReview(
 
   const linkedIssues = await getLinkedIssues(octokit, repo, pr.body);
   const system = buildSystemPrompt(config);
-  const user = buildUserPrompt(
-    {
-      title: pr.title,
-      description: pr.body,
-      linkedIssues,
-      baseRef: pr.baseRef,
-      headRef: pr.headRef,
-      incremental: scope.kind === "incremental",
-    },
-    files,
-    config,
-  );
+  const meta = {
+    title: pr.title,
+    description: pr.body,
+    linkedIssues,
+    baseRef: pr.baseRef,
+    headRef: pr.headRef,
+    incremental: scope.kind === "incremental",
+  };
 
+  // Every selected file is reviewed. When they don't all fit in one request we
+  // send several — splitting the work, never dropping any of it.
+  const batches = planBatches(files, config.batch_chars);
   core.info(
-    `Reviewing ${files.length} file(s) [${scope.kind}] with ${config.profile} profile…`,
+    `Reviewing ${files.length} file(s) [${scope.kind}] with ${config.profile} profile` +
+      (batches.length > 1 ? ` across ${batches.length} request(s)` : "") +
+      "…",
   );
-  const draft = await engine.review(system, user);
-  let result: ReviewResult = draft.result;
-  let tokens = draft.usage.total;
 
-  if (config.verification && result.findings.length > 0) {
-    core.info(`Verifying ${result.findings.length} finding(s)…`);
+  const partials: ReviewResult[] = [];
+  let tokens = 0;
+  let failed = 0;
+
+  for (const [i, batch] of batches.entries()) {
+    const label =
+      batches.length > 1
+        ? `Batch ${i + 1}/${batches.length} (${batch.length} file(s))`
+        : `${batch.length} file(s)`;
+    const user = buildUserPrompt(meta, batch, config);
+
+    let partial: ReviewResult;
     try {
-      const verified = await engine.verify(verificationPrompt(), user, result);
-      tokens += verified.usage.total;
-      // The verify pass returns a whole fresh result, so anything the model
-      // forgot to echo back would otherwise be silently lost.
-      result = {
-        overall_assessment:
-          verified.result.overall_assessment.trim() ||
-          draft.result.overall_assessment,
-        findings: verified.result.findings,
-        observations: verified.result.observations.length
-          ? verified.result.observations
-          : draft.result.observations,
-      };
+      const draft = await engine.review(system, user);
+      tokens += draft.usage.total;
+      partial = draft.result;
     } catch (err: any) {
-      core.warning(`Verification pass failed (${err.message}); keeping draft.`);
+      // One failed batch must not throw away the batches that succeeded.
+      failed++;
+      core.warning(`${label} failed to review (${err.message}); skipping it.`);
+      continue;
     }
+
+    if (config.verification && partial.findings.length > 0) {
+      core.info(`${label}: verifying ${partial.findings.length} finding(s)…`);
+      try {
+        const verified = await engine.verify(
+          verificationPrompt(),
+          user,
+          partial,
+        );
+        tokens += verified.usage.total;
+        // The verify pass returns a whole fresh result, so anything the model
+        // forgot to echo back would otherwise be silently lost.
+        partial = {
+          overall_assessment:
+            verified.result.overall_assessment.trim() ||
+            partial.overall_assessment,
+          findings: verified.result.findings,
+          observations: verified.result.observations.length
+            ? verified.result.observations
+            : partial.observations,
+        };
+      } catch (err: any) {
+        core.warning(
+          `${label}: verification pass failed (${err.message}); keeping draft.`,
+        );
+      }
+    }
+    partials.push(partial);
   }
+
+  if (partials.length === 0) {
+    throw new Error(
+      `All ${batches.length} review request(s) failed; leaving the PR untouched.`,
+    );
+  }
+  if (failed > 0) {
+    core.warning(
+      `${failed} of ${batches.length} batch(es) failed; the report covers the rest.`,
+    );
+  }
+
+  const result: ReviewResult = mergeResults(partials);
 
   // Always read existing comments, including on full runs — GitHub does not
   // dedupe, so skipping this re-posts every comment on `@bot full review`.
@@ -197,6 +240,25 @@ export async function runReview(
       (skippedByCap > 0 ? `; ${skippedByCap} file(s) over max_files` : "") +
       ".",
   );
+}
+
+/**
+ * Fold per-batch results into one. Findings and observations concatenate — each
+ * batch saw a disjoint set of files, so there is nothing to dedupe here;
+ * `mergeFindings` handles identity against previous runs downstream.
+ */
+function mergeResults(partials: ReviewResult[]): ReviewResult {
+  if (partials.length === 1) return partials[0];
+
+  const assessments = partials
+    .map((p) => p.overall_assessment.trim())
+    .filter((a) => a.length > 0);
+
+  return {
+    overall_assessment: assessments.join(" "),
+    findings: partials.flatMap((p) => p.findings),
+    observations: partials.flatMap((p) => p.observations),
+  };
 }
 
 /** Bump the counters that advance regardless of what the review found. */

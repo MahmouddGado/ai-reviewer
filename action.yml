@@ -1,6 +1,6 @@
 name: "AI Code Reviewer"
 description: "CodeRabbit-style AI reviews on every pull request and commit, powered by Claude"
-author: "your-org"
+author: "MahmouddGado"
 branding:
   icon: "eye"
   color: "orange"
@@ -24,10 +24,20 @@ inputs:
     description: "Path to the .aireviewer.yaml config file in the repo"
     required: false
     default: ".aireviewer.yaml"
+  # These deliberately have no `default:` — an input default would always beat
+  # the repo's .aireviewer.yaml. Unset means "use the yaml, else the built-in".
   max_files:
-    description: "Maximum number of files to review per run"
+    description: "Maximum files to review per run. 0 = no limit. Built-in default: 0 (review every changed file)."
     required: false
-    default: "50"
+  batch_chars:
+    description: "Chars of diff per model request. Files are split across as many requests as needed; this never reduces how much is reviewed. Built-in default: 200000."
+    required: false
+  max_output_tokens:
+    description: "Output token cap per model request. Raise if reviews look cut off. Built-in default: 32000."
+    required: false
+  review_generated:
+    description: "Also review lock files, minified bundles, dist/, and snapshots. Built-in default: false."
+    required: false
   review_profile:
     description: "Default review profile: quiet | chill | assertive"
     required: false

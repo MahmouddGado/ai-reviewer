@@ -21,9 +21,10 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: your-org/ai-reviewer@v1
+      - uses: MahmouddGado/ai-reviewer@v1
         with:
           api_key: ${{ secrets.ZAI_API_KEY }}          # z.ai API key
           github_token: ${{ secrets.GITHUB_TOKEN }}
           model: glm-5.2                                # z.ai GLM 5.2
+          max_files: 0                                  # review every changed file
           # base_url defaults to https://api.z.ai/api/anthropic

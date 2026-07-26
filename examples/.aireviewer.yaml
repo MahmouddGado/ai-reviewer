@@ -1,6 +1,8 @@
 # Copy to the ROOT of a consuming repo as `.aireviewer.yaml`. All keys are optional.
 profile: chill               # quiet | chill | assertive
-max_files: 50
+max_files: 0                 # 0 = no limit; review every changed file
+batch_chars: 200000          # diff chars per model request (files are split, never dropped)
+review_generated: false      # true also reviews lock files, dist/, minified bundles
 
 auto_review:
   enabled: true

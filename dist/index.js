@@ -36511,10 +36511,20 @@ async function run() {
         const model = core.getInput("model") || "glm-5.2";
         const baseUrl = core.getInput("base_url") || "https://api.z.ai/api/anthropic";
         const configPath = core.getInput("config_path") || ".aireviewer.yaml";
+        // An unset input is "", which must stay undefined so .aireviewer.yaml wins.
+        // Note Number("") === 0, and 0 is a meaningful max_files, so the emptiness
+        // check has to come before the numeric one.
         const overrides = {};
-        const maxFiles = Number(core.getInput("max_files"));
-        if (Number.isFinite(maxFiles) && maxFiles > 0)
+        const maxFiles = intInput("max_files");
+        if (maxFiles !== undefined && maxFiles >= 0)
             overrides.max_files = maxFiles;
+        const batchChars = intInput("batch_chars");
+        if (batchChars !== undefined && batchChars > 0) {
+            overrides.batch_chars = batchChars;
+        }
+        const reviewGenerated = core.getInput("review_generated").trim();
+        if (reviewGenerated)
+            overrides.review_generated = reviewGenerated === "true";
         const profile = core.getInput("review_profile");
         if (profile === "quiet" || profile === "chill" || profile === "assertive") {
             overrides.profile = profile;
@@ -36522,7 +36532,7 @@ async function run() {
         const octokit = (0, client_1.makeOctokit)(token);
         const ctx = github.context;
         const repo = { owner: ctx.repo.owner, repo: ctx.repo.repo };
-        const engine = new engine_1.ReviewEngine(apiKey, model, baseUrl);
+        const engine = new engine_1.ReviewEngine(apiKey, model, baseUrl, intInput("max_output_tokens"));
         const pull_number = await resolvePrNumber(octokit, repo, ctx);
         if (!pull_number) {
             core.info("Event is not associated with a pull request. Skipping.");
@@ -36595,6 +36605,18 @@ async function onPullRequest(octokit, repo, pull_number, config, engine, ctx) {
         forceFull,
         summaryOnly: false,
     });
+}
+/** Read an integer input, returning undefined when it is absent or unparseable. */
+function intInput(name) {
+    const raw = core.getInput(name).trim();
+    if (!raw)
+        return undefined;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) {
+        core.warning(`Ignoring non-numeric ${name}: '${raw}'.`);
+        return undefined;
+    }
+    return Math.trunc(n);
 }
 /** Determine the PR number from whichever event triggered the run. */
 async function resolvePrNumber(_octokit, _repo, ctx) {
@@ -36724,6 +36746,94 @@ function clamp(s, max) {
 
 /***/ }),
 
+/***/ 7048:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.planBatches = planBatches;
+const core = __importStar(__nccwpck_require__(7484));
+/**
+ * Splitting exists so `max_files: 0` (unlimited) is actually usable: a 300-file
+ * PR cannot go into one request, but it can go into eight. Nothing is ever
+ * dropped or truncated here — a file too big for a whole batch still gets its
+ * own batch and is sent in full.
+ */
+function planBatches(files, charBudget) {
+    if (files.length === 0)
+        return [];
+    if (!Number.isFinite(charBudget) || charBudget <= 0)
+        return [files];
+    const batches = [];
+    let current = [];
+    let size = 0;
+    for (const f of files) {
+        const cost = fileCost(f);
+        // A single file over budget goes alone rather than being cut down.
+        if (cost >= charBudget) {
+            if (current.length) {
+                batches.push(current);
+                current = [];
+                size = 0;
+            }
+            batches.push([f]);
+            core.info(`${f.path} is ${f.rendered.length} chars — reviewing it in a batch of its own.`);
+            continue;
+        }
+        if (current.length && size + cost > charBudget) {
+            batches.push(current);
+            current = [];
+            size = 0;
+        }
+        current.push(f);
+        size += cost;
+    }
+    if (current.length)
+        batches.push(current);
+    return batches;
+}
+/** Rendered diff plus the per-file heading/fence overhead `buildUserPrompt` adds. */
+function fileCost(f) {
+    return f.rendered.length + f.path.length + 32;
+}
+
+
+/***/ }),
+
 /***/ 6410:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -36792,7 +36902,8 @@ function selectFiles(diffFiles, config) {
             dropped.push({ path: f.path, reason: "binary" });
             return false;
         }
-        if (ALWAYS_IGNORE.some((g) => (0, minimatch_1.minimatch)(f.path, g))) {
+        if (!config.review_generated &&
+            ALWAYS_IGNORE.some((g) => (0, minimatch_1.minimatch)(f.path, g))) {
             dropped.push({ path: f.path, reason: "generated" });
             return false;
         }
@@ -36806,15 +36917,20 @@ function selectFiles(diffFiles, config) {
         }
         return true;
     });
-    // Largest changes first, so if we hit the cap we review the most substantial files.
+    // Largest changes first, so if a cap IS set we review the most substantial files.
     kept.sort((a, b) => b.additions + b.deletions - (a.additions + a.deletions));
-    const files = kept.slice(0, config.max_files);
-    for (const f of kept.slice(config.max_files)) {
-        dropped.push({ path: f.path, reason: "cap" });
+    // max_files: 0 means no cap — every changed file is reviewed, batched across
+    // as many model calls as it takes.
+    const unlimited = config.max_files === 0;
+    const files = unlimited ? kept : kept.slice(0, config.max_files);
+    if (!unlimited) {
+        for (const f of kept.slice(config.max_files)) {
+            dropped.push({ path: f.path, reason: "cap" });
+        }
     }
     const skippedByCap = kept.length - files.length;
     if (skippedByCap > 0) {
-        core.warning(`${skippedByCap} file(s) exceeded max_files=${config.max_files} and were not reviewed.`);
+        core.warning(`${skippedByCap} file(s) exceeded max_files=${config.max_files} and were not reviewed. Set max_files: 0 to review everything.`);
     }
     return {
         files,
@@ -36928,16 +37044,23 @@ const core = __importStar(__nccwpck_require__(7484));
 const sdk_1 = __importDefault(__nccwpck_require__(121));
 const types_1 = __nccwpck_require__(8522);
 const TOOL_NAME = "submit_review";
-/** Dense finding bodies plus observations plus the assessment outgrow 8k fast. */
-const MAX_TOKENS = 16000;
+/**
+ * Dense finding bodies plus observations plus the assessment outgrow 8k fast,
+ * and a batch of large files can carry dozens of findings. Overridable via the
+ * `max_output_tokens` input for models with a smaller ceiling.
+ */
+const DEFAULT_MAX_TOKENS = 32000;
 class ReviewEngine {
     model;
     client;
-    constructor(apiKey, model, baseURL) {
+    maxTokens;
+    constructor(apiKey, model, baseURL, maxTokens) {
         this.model = model;
         // baseURL points the Anthropic SDK at z.ai's Anthropic-compatible endpoint
         // (https://api.z.ai/api/anthropic) so GLM models work with no code changes.
         this.client = new sdk_1.default({ apiKey, ...(baseURL ? { baseURL } : {}) });
+        this.maxTokens =
+            maxTokens && maxTokens > 0 ? maxTokens : DEFAULT_MAX_TOKENS;
     }
     async review(system, user) {
         return this.call(system, [{ role: "user", content: user }]);
@@ -36972,7 +37095,7 @@ class ReviewEngine {
     async call(system, messages) {
         const response = await this.client.messages.create({
             model: this.model,
-            max_tokens: MAX_TOKENS,
+            max_tokens: this.maxTokens,
             system,
             tools: [
                 {
@@ -36986,7 +37109,7 @@ class ReviewEngine {
         });
         const usage = readUsage(response);
         if (response.stop_reason === "max_tokens") {
-            core.warning(`Model hit the ${MAX_TOKENS}-token output cap; the review may be incomplete. Consider lowering max_files or splitting the PR.`);
+            core.warning(`Model hit the ${this.maxTokens}-token output cap; this batch's review may be incomplete. Consider lowering batch_chars so each request carries fewer files.`);
         }
         const toolUse = response.content.find((c) => c.type === "tool_use");
         if (!toolUse) {
@@ -37090,6 +37213,7 @@ const review_1 = __nccwpck_require__(6163);
 const context_1 = __nccwpck_require__(3823);
 const scope_1 = __nccwpck_require__(8324);
 const chunker_1 = __nccwpck_require__(6410);
+const batch_1 = __nccwpck_require__(7048);
 const prompts_1 = __nccwpck_require__(7963);
 const render_1 = __nccwpck_require__(746);
 const accumulate_1 = __nccwpck_require__(8028);
@@ -37126,38 +37250,69 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
     }
     const linkedIssues = await (0, context_1.getLinkedIssues)(octokit, repo, pr.body);
     const system = (0, prompts_1.buildSystemPrompt)(config);
-    const user = (0, prompts_1.buildUserPrompt)({
+    const meta = {
         title: pr.title,
         description: pr.body,
         linkedIssues,
         baseRef: pr.baseRef,
         headRef: pr.headRef,
         incremental: scope.kind === "incremental",
-    }, files, config);
-    core.info(`Reviewing ${files.length} file(s) [${scope.kind}] with ${config.profile} profile…`);
-    const draft = await engine.review(system, user);
-    let result = draft.result;
-    let tokens = draft.usage.total;
-    if (config.verification && result.findings.length > 0) {
-        core.info(`Verifying ${result.findings.length} finding(s)…`);
+    };
+    // Every selected file is reviewed. When they don't all fit in one request we
+    // send several — splitting the work, never dropping any of it.
+    const batches = (0, batch_1.planBatches)(files, config.batch_chars);
+    core.info(`Reviewing ${files.length} file(s) [${scope.kind}] with ${config.profile} profile` +
+        (batches.length > 1 ? ` across ${batches.length} request(s)` : "") +
+        "…");
+    const partials = [];
+    let tokens = 0;
+    let failed = 0;
+    for (const [i, batch] of batches.entries()) {
+        const label = batches.length > 1
+            ? `Batch ${i + 1}/${batches.length} (${batch.length} file(s))`
+            : `${batch.length} file(s)`;
+        const user = (0, prompts_1.buildUserPrompt)(meta, batch, config);
+        let partial;
         try {
-            const verified = await engine.verify((0, prompts_1.verificationPrompt)(), user, result);
-            tokens += verified.usage.total;
-            // The verify pass returns a whole fresh result, so anything the model
-            // forgot to echo back would otherwise be silently lost.
-            result = {
-                overall_assessment: verified.result.overall_assessment.trim() ||
-                    draft.result.overall_assessment,
-                findings: verified.result.findings,
-                observations: verified.result.observations.length
-                    ? verified.result.observations
-                    : draft.result.observations,
-            };
+            const draft = await engine.review(system, user);
+            tokens += draft.usage.total;
+            partial = draft.result;
         }
         catch (err) {
-            core.warning(`Verification pass failed (${err.message}); keeping draft.`);
+            // One failed batch must not throw away the batches that succeeded.
+            failed++;
+            core.warning(`${label} failed to review (${err.message}); skipping it.`);
+            continue;
         }
+        if (config.verification && partial.findings.length > 0) {
+            core.info(`${label}: verifying ${partial.findings.length} finding(s)…`);
+            try {
+                const verified = await engine.verify((0, prompts_1.verificationPrompt)(), user, partial);
+                tokens += verified.usage.total;
+                // The verify pass returns a whole fresh result, so anything the model
+                // forgot to echo back would otherwise be silently lost.
+                partial = {
+                    overall_assessment: verified.result.overall_assessment.trim() ||
+                        partial.overall_assessment,
+                    findings: verified.result.findings,
+                    observations: verified.result.observations.length
+                        ? verified.result.observations
+                        : partial.observations,
+                };
+            }
+            catch (err) {
+                core.warning(`${label}: verification pass failed (${err.message}); keeping draft.`);
+            }
+        }
+        partials.push(partial);
     }
+    if (partials.length === 0) {
+        throw new Error(`All ${batches.length} review request(s) failed; leaving the PR untouched.`);
+    }
+    if (failed > 0) {
+        core.warning(`${failed} of ${batches.length} batch(es) failed; the report covers the rest.`);
+    }
+    const result = mergeResults(partials);
     // Always read existing comments, including on full runs — GitHub does not
     // dedupe, so skipping this re-posts every comment on `@bot full review`.
     const existing = await (0, review_1.readExistingComments)(octokit, repo, pull_number);
@@ -37189,6 +37344,23 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
         `Totals: ${findings.length} finding(s) across ${roster.length} file(s)` +
         (skippedByCap > 0 ? `; ${skippedByCap} file(s) over max_files` : "") +
         ".");
+}
+/**
+ * Fold per-batch results into one. Findings and observations concatenate — each
+ * batch saw a disjoint set of files, so there is nothing to dedupe here;
+ * `mergeFindings` handles identity against previous runs downstream.
+ */
+function mergeResults(partials) {
+    if (partials.length === 1)
+        return partials[0];
+    const assessments = partials
+        .map((p) => p.overall_assessment.trim())
+        .filter((a) => a.length > 0);
+    return {
+        overall_assessment: assessments.join(" "),
+        findings: partials.flatMap((p) => p.findings),
+        observations: partials.flatMap((p) => p.observations),
+    };
 }
 /** Bump the counters that advance regardless of what the review found. */
 function advance(base, pr, tokens, counted) {
@@ -37682,7 +37854,15 @@ exports.AutoReviewSchema = zod_1.z.object({
 });
 exports.ConfigSchema = zod_1.z.object({
     profile: zod_1.z.enum(["quiet", "chill", "assertive"]).default("chill"),
-    max_files: zod_1.z.number().int().positive().default(50),
+    /** 0 = review every changed file, however many there are. */
+    max_files: zod_1.z.number().int().nonnegative().default(0),
+    /**
+     * Chars of rendered diff per model request. Files are split across as many
+     * requests as needed, so this bounds each call — never how much gets reviewed.
+     */
+    batch_chars: zod_1.z.number().int().positive().default(200000),
+    /** Review lock files, minified bundles, `dist/`, snapshots — off by default. */
+    review_generated: zod_1.z.boolean().default(false),
     auto_review: exports.AutoReviewSchema.default({}),
     path_filters: zod_1.z.array(zod_1.z.string()).default([]),
     path_instructions: zod_1.z.array(exports.PathInstructionSchema).default([]),

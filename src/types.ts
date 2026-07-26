@@ -18,7 +18,15 @@ export const AutoReviewSchema = z.object({
 
 export const ConfigSchema = z.object({
   profile: z.enum(["quiet", "chill", "assertive"]).default("chill"),
-  max_files: z.number().int().positive().default(50),
+  /** 0 = review every changed file, however many there are. */
+  max_files: z.number().int().nonnegative().default(0),
+  /**
+   * Chars of rendered diff per model request. Files are split across as many
+   * requests as needed, so this bounds each call — never how much gets reviewed.
+   */
+  batch_chars: z.number().int().positive().default(200000),
+  /** Review lock files, minified bundles, `dist/`, snapshots — off by default. */
+  review_generated: z.boolean().default(false),
   auto_review: AutoReviewSchema.default({}),
   path_filters: z.array(z.string()).default([]),
   path_instructions: z.array(PathInstructionSchema).default([]),
