@@ -1,16 +1,12 @@
 import * as core from "@actions/core";
 import { Octokit, Repo } from "../github/client";
-import { Config, Finding, ReviewResult } from "../types";
+import { Config, FileKind, ReviewResult, StoredFile } from "../types";
 import { parseDiffFiles } from "../github/diff";
-import {
-  ReviewState,
-  readState,
-  writeWalkthrough,
-} from "../github/state";
+import { ReviewState, readState, writeSummary } from "../github/state";
 import {
   buildInlineComments,
-  existingCommentSignatures,
   postReview,
+  readExistingComments,
 } from "../github/review";
 import { getLinkedIssues, getPrDetails, PrDetails } from "./context";
 import { resolveScope } from "./scope";
@@ -21,10 +17,24 @@ import {
   buildUserPrompt,
   verificationPrompt,
 } from "./prompts";
+import {
+  applyIssueCounts,
+  buildRoster,
+  mergeRoster,
+  renderSummaryComment,
+} from "./render";
+import {
+  dropObservationsWithComments,
+  findingToObservation,
+  mergeFindings,
+  mergeObservations,
+  toStoredFinding,
+  toStoredObservation,
+} from "./accumulate";
 
 export interface RunOptions {
   forceFull: boolean; // full review vs incremental
-  summaryOnly: boolean; // only regenerate the walkthrough
+  summaryOnly: boolean; // only re-render the sticky summary
 }
 
 export async function runReview(
@@ -36,20 +46,41 @@ export async function runReview(
   opts: RunOptions,
 ): Promise<void> {
   const pr = await getPrDetails(octokit, repo, pull_number);
-  const state = await readState(octokit, repo, pull_number);
+  const prev = await readState(octokit, repo, pull_number);
 
-  const scope = await resolveScope(octokit, repo, pr, state, opts.forceFull);
+  // `@bot summary` just redraws the sticky comment from what we already know —
+  // no diff, no model call, no tokens.
+  if (opts.summaryOnly) {
+    await publishSummary(octokit, repo, pr, prev, engine.model);
+    core.info("Re-rendered the summary comment from stored state.");
+    return;
+  }
+
+  // A full review rebuilds the totals from scratch; that's the escape hatch if
+  // accumulation ever drifts.
+  const base: ReviewState = opts.forceFull
+    ? { ...prev, findings: [], observations: [], files: [] }
+    : prev;
+
+  const scope = await resolveScope(octokit, repo, pr, prev, opts.forceFull);
   if (!scope.hasChanges) {
     core.info("No reviewable changes in scope. Nothing to do.");
-    await bumpState(octokit, repo, pr, state, null);
+    await publishSummary(octokit, repo, pr, advance(base, pr, 0, false), engine.model);
     return;
   }
 
   const allFiles = parseDiffFiles(scope.diffText);
-  const { files, skippedByFilter, skippedByCap } = selectFiles(allFiles, config);
+  const { files, dropped, skippedByCap } = selectFiles(allFiles, config);
   if (files.length === 0) {
     core.info("All changed files were filtered out. Nothing to review.");
-    await bumpState(octokit, repo, pr, state, null);
+    const roster = buildRoster(
+      allFiles.map((f) => f.path),
+      new Map(dropped.map((d) => [d.path, d.reason as FileKind])),
+      new Map(),
+    );
+    const next = advance(base, pr, 0, false);
+    next.files = mergeRoster(base.files, roster);
+    await publishSummary(octokit, repo, pr, next, engine.model);
     return;
   }
 
@@ -71,118 +102,162 @@ export async function runReview(
   core.info(
     `Reviewing ${files.length} file(s) [${scope.kind}] with ${config.profile} profile…`,
   );
-  let result: ReviewResult = await engine.review(system, user);
+  const draft = await engine.review(system, user);
+  let result: ReviewResult = draft.result;
+  let tokens = draft.usage.total;
 
   if (config.verification && result.findings.length > 0) {
     core.info(`Verifying ${result.findings.length} finding(s)…`);
     try {
-      result = await engine.verify(verificationPrompt(), user, result);
+      const verified = await engine.verify(verificationPrompt(), user, result);
+      tokens += verified.usage.total;
+      // The verify pass returns a whole fresh result, so anything the model
+      // forgot to echo back would otherwise be silently lost.
+      result = {
+        overall_assessment:
+          verified.result.overall_assessment.trim() ||
+          draft.result.overall_assessment,
+        findings: verified.result.findings,
+        observations: verified.result.observations.length
+          ? verified.result.observations
+          : draft.result.observations,
+      };
     } catch (err: any) {
       core.warning(`Verification pass failed (${err.message}); keeping draft.`);
     }
   }
 
-  const existing =
-    scope.kind === "incremental"
-      ? await existingCommentSignatures(octokit, repo, pull_number)
-      : new Set<string>();
+  // Always read existing comments, including on full runs — GitHub does not
+  // dedupe, so skipping this re-posts every comment on `@bot full review`.
+  const existing = await readExistingComments(octokit, repo, pull_number);
 
-  const { comments, skipped } = buildInlineComments(
+  const { comments, unanchored, duplicates } = buildInlineComments(
     result.findings,
     files,
     existing,
   );
 
-  const summary = renderSummary(result, scope.kind, {
-    reviewed: files.length,
-    findings: comments.length,
-    skippedByFilter,
-    skippedByCap,
-    skippedUnanchored: skipped,
-  });
+  await postReview(
+    octokit,
+    repo,
+    pull_number,
+    pr.headSha,
+    reviewBody(files.length, pr.headSha, comments.length),
+    comments,
+  );
 
-  if (!opts.summaryOnly) {
-    await postReview(octokit, repo, pull_number, pr.headSha, summary, comments);
-  }
+  /* ---- fold this run into the running totals ---- */
 
-  const walkthrough = renderWalkthrough(result, scope.kind);
-  await bumpState(octokit, repo, pr, state, walkthrough);
+  const reviewedPaths = new Set(files.map((f) => f.path));
+  const freshFindings = result.findings
+    .filter((f) => !unanchored.includes(f))
+    .map(toStoredFinding);
+
+  const { findings, expired } = mergeFindings(
+    base.findings,
+    freshFindings,
+    existing.byId,
+  );
+
+  const freshObservations = [
+    ...result.observations.map(toStoredObservation),
+    ...unanchored.map(findingToObservation),
+  ];
+  const observations = dropObservationsWithComments(
+    mergeObservations(base.observations, freshObservations, reviewedPaths),
+    findings,
+  );
+
+  const issueCounts = new Map<string, number>();
+  for (const f of findings) issueCounts.set(f.p, (issueCounts.get(f.p) ?? 0) + 1);
+  const roster: StoredFile[] = applyIssueCounts(
+    mergeRoster(
+      base.files,
+      buildRoster(
+        allFiles.map((f) => f.path),
+        new Map(dropped.map((d) => [d.path, d.reason as FileKind])),
+        issueCounts,
+      ),
+    ),
+    findings,
+  );
+
+  const next = advance(base, pr, tokens, true);
+  next.findings = findings;
+  next.observations = observations;
+  next.files = roster;
+  next.assessment = result.overall_assessment.trim() || base.assessment;
+
+  await publishSummary(octokit, repo, pr, next, engine.model);
 
   core.info(
-    `Done. Posted ${comments.length} inline comment(s); skipped ${skipped}.`,
+    `Done. ${comments.length} new comment(s), ${duplicates.length} duplicate(s) skipped, ` +
+      `${unanchored.length} demoted to observations, ${expired.length} expired. ` +
+      `Totals: ${findings.length} finding(s) across ${roster.length} file(s)` +
+      (skippedByCap > 0 ? `; ${skippedByCap} file(s) over max_files` : "") +
+      ".",
   );
 }
 
-async function bumpState(
+/** Bump the counters that advance regardless of what the review found. */
+function advance(
+  base: ReviewState,
+  pr: PrDetails,
+  tokens: number,
+  counted: boolean,
+): ReviewState {
+  return {
+    ...base,
+    lastReviewedSha: pr.headSha,
+    reviewCount: base.reviewCount + (counted ? 1 : 0),
+    tokens: base.tokens + tokens,
+  };
+}
+
+/**
+ * Render and upsert the sticky comment. The state marker shares the comment body
+ * with the rendered block, so the renderer is handed whatever space is left.
+ */
+async function publishSummary(
   octokit: Octokit,
   repo: Repo,
   pr: PrDetails,
-  prev: ReviewState,
-  walkthrough: string | null,
+  state: ReviewState,
+  model: string,
 ): Promise<void> {
-  const next: ReviewState = {
-    lastReviewedSha: pr.headSha,
-    reviewCount: prev.reviewCount + (walkthrough ? 1 : 0),
-    paused: prev.paused,
-  };
-  await writeWalkthrough(octokit, repo, pr.number, walkthrough, next);
-}
-
-interface Stats {
-  reviewed: number;
-  findings: number;
-  skippedByFilter: number;
-  skippedByCap: number;
-  skippedUnanchored: number;
-}
-
-function renderSummary(
-  result: ReviewResult,
-  kind: "full" | "incremental",
-  stats: Stats,
-): string {
-  const lines = [
-    `**AI review (${kind})** — reviewed ${stats.reviewed} file(s), ${stats.findings} comment(s).`,
-  ];
-  if (stats.skippedByCap > 0) {
-    lines.push(
-      `> ⚠️ ${stats.skippedByCap} file(s) skipped (over \`max_files\`). Raise the limit or split the PR.`,
+  const next: ReviewState = { ...state, model };
+  await writeSummary(octokit, repo, pr.number, next, (budget) => {
+    const { body, degradation, dropped } = renderSummaryComment(
+      {
+        findings: next.findings,
+        observations: next.observations,
+        files: next.files,
+        assessment: next.assessment,
+        model,
+        tokens: next.tokens,
+      },
+      budget,
     );
-  }
-  const counts = countBySeverity(result.findings);
-  if (stats.findings > 0) {
-    lines.push(
-      `\n${counts.potential_issue} potential issue(s) · ${counts.refactor} refactor(s) · ${counts.nitpick} nitpick(s).`,
-    );
-  } else {
-    lines.push("\nNo blocking issues found. 🐰");
-  }
-  return lines.join("\n");
-}
-
-function renderWalkthrough(
-  result: ReviewResult,
-  kind: "full" | "incremental",
-): string {
-  const parts = [`## 🐰 AI Review — Walkthrough`, "", result.walkthrough];
-  if (result.changed_files.length) {
-    parts.push("\n### Changed files");
-    parts.push("| File | Summary |", "| --- | --- |");
-    for (const f of result.changed_files) {
-      parts.push(`| \`${f.path}\` | ${f.summary.replace(/\|/g, "\\|")} |`);
+    if (degradation !== "none") {
+      core.warning(
+        `Summary shrunk to fit GitHub's comment limit (level: ${degradation}${
+          dropped ? `, ${dropped} row(s) hidden` : ""
+        }).`,
+      );
     }
-  }
-  parts.push(
-    `\n<sub>Last review: ${kind}. Push a commit for an incremental re-review, or comment \`@bot help\`.</sub>`,
-  );
-  return parts.join("\n");
+    return body;
+  });
 }
 
-function countBySeverity(findings: Finding[]) {
-  return {
-    potential_issue: findings.filter((f) => f.severity === "potential_issue")
-      .length,
-    refactor: findings.filter((f) => f.severity === "refactor").length,
-    nitpick: findings.filter((f) => f.severity === "nitpick").length,
-  };
+/**
+ * The review object exists only to carry the inline comments; the full report
+ * lives in the sticky comment so it can be updated in place on every push.
+ */
+function reviewBody(
+  reviewed: number,
+  headSha: string,
+  comments: number,
+): string {
+  const noun = comments === 1 ? "comment" : "comments";
+  return `Reviewed ${reviewed} file(s) at \`${headSha.slice(0, 7)}\` — ${comments} new inline ${noun}. See the **Code Review Summary** comment for the full report.`;
 }

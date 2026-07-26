@@ -1,6 +1,7 @@
 import * as core from "@actions/core";
 import Anthropic from "@anthropic-ai/sdk";
 import {
+  FindingSchema,
   REVIEW_TOOL_SCHEMA,
   ReviewResult,
   ReviewResultSchema,
@@ -8,11 +9,25 @@ import {
 
 const TOOL_NAME = "submit_review";
 
+/** Dense finding bodies plus observations plus the assessment outgrow 8k fast. */
+const MAX_TOKENS = 16000;
+
+export interface CallUsage {
+  input: number;
+  output: number;
+  total: number;
+}
+
+export interface EngineResult {
+  result: ReviewResult;
+  usage: CallUsage;
+}
+
 export class ReviewEngine {
   private client: Anthropic;
   constructor(
     apiKey: string,
-    private model: string,
+    public readonly model: string,
     baseURL?: string,
   ) {
     // baseURL points the Anthropic SDK at z.ai's Anthropic-compatible endpoint
@@ -20,7 +35,7 @@ export class ReviewEngine {
     this.client = new Anthropic({ apiKey, ...(baseURL ? { baseURL } : {}) });
   }
 
-  async review(system: string, user: string): Promise<ReviewResult> {
+  async review(system: string, user: string): Promise<EngineResult> {
     return this.call(system, [{ role: "user", content: user }]);
   }
 
@@ -29,7 +44,7 @@ export class ReviewEngine {
     system: string,
     user: string,
     draft: ReviewResult,
-  ): Promise<ReviewResult> {
+  ): Promise<EngineResult> {
     return this.call(system, [
       { role: "user", content: user },
       {
@@ -59,22 +74,30 @@ export class ReviewEngine {
   private async call(
     system: string,
     messages: Anthropic.MessageParam[],
-  ): Promise<ReviewResult> {
+  ): Promise<EngineResult> {
     const response = await this.client.messages.create({
       model: this.model,
-      max_tokens: 8000,
+      max_tokens: MAX_TOKENS,
       system,
       tools: [
         {
           name: TOOL_NAME,
           description:
-            "Submit the structured code review (walkthrough, changed files, and line-anchored findings).",
+            "Submit the structured code review (overall assessment, line-anchored findings, and out-of-diff observations).",
           input_schema: REVIEW_TOOL_SCHEMA as any,
         },
       ],
       tool_choice: { type: "tool", name: TOOL_NAME },
       messages,
     });
+
+    const usage = readUsage(response);
+
+    if (response.stop_reason === "max_tokens") {
+      core.warning(
+        `Model hit the ${MAX_TOKENS}-token output cap; the review may be incomplete. Consider lowering max_files or splitting the PR.`,
+      );
+    }
 
     const toolUse = response.content.find(
       (c): c is Anthropic.ToolUseBlock => c.type === "tool_use",
@@ -84,20 +107,57 @@ export class ReviewEngine {
     }
 
     const parsed = ReviewResultSchema.safeParse(toolUse.input);
-    if (!parsed.success) {
-      core.warning(
-        `Model output failed validation: ${parsed.error.issues
-          .map((i) => i.message)
-          .join("; ")}`,
-      );
-      // Best-effort salvage: coerce with defaults.
-      return ReviewResultSchema.parse({
-        walkthrough:
-          (toolUse.input as any)?.walkthrough ?? "Review completed.",
-        changed_files: (toolUse.input as any)?.changed_files ?? [],
-        findings: [],
-      });
-    }
-    return parsed.data;
+    if (parsed.success) return { result: parsed.data, usage };
+
+    core.warning(
+      `Model output failed validation: ${parsed.error.issues
+        .map((i) => i.message)
+        .join("; ")}`,
+    );
+    return { result: salvage(toolUse.input), usage };
   }
+}
+
+/**
+ * A truncated or malformed tool call used to be discarded wholesale, which
+ * reported a clean PR when the model had actually found problems. Keep every
+ * finding that validates individually and drop only the ones that don't.
+ */
+function salvage(input: unknown): ReviewResult {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  const findings = Array.isArray(raw.findings)
+    ? raw.findings.flatMap((f) => {
+        const one = FindingSchema.safeParse(f);
+        return one.success ? [one.data] : [];
+      })
+    : [];
+
+  if (findings.length > 0) {
+    core.warning(`Salvaged ${findings.length} finding(s) from a partial response.`);
+  }
+
+  return ReviewResultSchema.parse({
+    overall_assessment:
+      typeof raw.overall_assessment === "string" ? raw.overall_assessment : "",
+    findings,
+    observations: [],
+  });
+}
+
+/**
+ * z.ai's Anthropic-compatible endpoint doesn't always populate the cache fields,
+ * so every component is read defensively and the total may legitimately be 0.
+ */
+function readUsage(response: Anthropic.Message): CallUsage {
+  const u = (response as any).usage ?? {};
+  const input =
+    num(u.input_tokens) +
+    num(u.cache_creation_input_tokens) +
+    num(u.cache_read_input_tokens);
+  const output = num(u.output_tokens);
+  return { input, output, total: input + output };
+}
+
+function num(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }

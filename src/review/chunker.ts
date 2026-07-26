@@ -16,8 +16,22 @@ const ALWAYS_IGNORE = [
   "**/*.snap",
 ];
 
+/** Why a changed file never reached the model. Drives the Files Reviewed roster. */
+export type DropReason =
+  | "generated"
+  | "filtered"
+  | "cap"
+  | "binary"
+  | "deleted";
+
+export interface DroppedFile {
+  path: string;
+  reason: DropReason;
+}
+
 export interface SelectedFiles {
   files: DiffFile[];
+  dropped: DroppedFile[];
   skippedByFilter: number;
   skippedByCap: number;
 }
@@ -27,22 +41,29 @@ export function selectFiles(
   diffFiles: DiffFile[],
   config: Config,
 ): SelectedFiles {
-  const excludes = [...ALWAYS_IGNORE, ...extractNegated(config.path_filters)];
+  const userExcludes = extractNegated(config.path_filters);
   const includes = extractPositive(config.path_filters);
-
-  let skippedByFilter = 0;
+  const dropped: DroppedFile[] = [];
 
   const kept = diffFiles.filter((f) => {
-    if (f.isBinary || f.isDeleted || f.commentableLines.size === 0) {
-      skippedByFilter++;
+    if (f.isDeleted) {
+      dropped.push({ path: f.path, reason: "deleted" });
       return false;
     }
-    if (excludes.some((g) => minimatch(f.path, g))) {
-      skippedByFilter++;
+    if (f.isBinary || f.commentableLines.size === 0) {
+      dropped.push({ path: f.path, reason: "binary" });
+      return false;
+    }
+    if (ALWAYS_IGNORE.some((g) => minimatch(f.path, g))) {
+      dropped.push({ path: f.path, reason: "generated" });
+      return false;
+    }
+    if (userExcludes.some((g) => minimatch(f.path, g))) {
+      dropped.push({ path: f.path, reason: "filtered" });
       return false;
     }
     if (includes.length && !includes.some((g) => minimatch(f.path, g))) {
-      skippedByFilter++;
+      dropped.push({ path: f.path, reason: "filtered" });
       return false;
     }
     return true;
@@ -52,6 +73,10 @@ export function selectFiles(
   kept.sort((a, b) => b.additions + b.deletions - (a.additions + a.deletions));
 
   const files = kept.slice(0, config.max_files);
+  for (const f of kept.slice(config.max_files)) {
+    dropped.push({ path: f.path, reason: "cap" });
+  }
+
   const skippedByCap = kept.length - files.length;
   if (skippedByCap > 0) {
     core.warning(
@@ -59,7 +84,12 @@ export function selectFiles(
     );
   }
 
-  return { files, skippedByFilter, skippedByCap };
+  return {
+    files,
+    dropped,
+    skippedByFilter: dropped.length - skippedByCap,
+    skippedByCap,
+  };
 }
 
 function extractNegated(filters: string[]): string[] {
