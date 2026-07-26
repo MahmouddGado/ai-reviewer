@@ -35691,6 +35691,7 @@ exports.handleCommand = handleCommand;
 const core = __importStar(__nccwpck_require__(7484));
 const orchestrator_1 = __nccwpck_require__(6222);
 const state_1 = __nccwpck_require__(8862);
+const render_1 = __nccwpck_require__(746);
 const review_1 = __nccwpck_require__(6163);
 const MENTION = /@(?:bot|coderabbitai|ai-reviewer)\b/i;
 /** Parse a PR/issue comment body into a command, or null if it isn't for us. */
@@ -35730,8 +35731,9 @@ async function handleCommand(command, octokit, repo, pull_number, config, engine
             });
             break;
         case "summary":
+            // Redraws the sticky comment from stored state — no model call, no tokens.
             await (0, orchestrator_1.runReview)(octokit, repo, pull_number, config, engine, {
-                forceFull: true,
+                forceFull: false,
                 summaryOnly: true,
             });
             break;
@@ -35743,7 +35745,14 @@ async function handleCommand(command, octokit, repo, pull_number, config, engine
         case "resume": {
             const state = await (0, state_1.readState)(octokit, repo, pull_number);
             state.paused = command === "pause";
-            await (0, state_1.writeWalkthrough)(octokit, repo, pull_number, null, state);
+            await (0, state_1.writeSummary)(octokit, repo, pull_number, state, (budget) => (0, render_1.renderSummaryComment)({
+                findings: state.findings,
+                observations: state.observations,
+                files: state.files,
+                assessment: state.assessment,
+                model: state.model || engine.model,
+                tokens: state.tokens,
+            }, budget).body);
             await (0, review_1.postIssueComment)(octokit, repo, pull_number, command === "pause"
                 ? "⏸️ Automatic reviews paused. Comment `@bot resume` to re-enable."
                 : "▶️ Automatic reviews resumed.");
@@ -35783,13 +35792,13 @@ async function resolveThreads(octokit, repo, pull_number) {
 }
 function helpText() {
     return [
-        "### 🐰 AI Reviewer — commands",
+        "### AI Reviewer — commands",
         "",
         "| Command | Action |",
         "| --- | --- |",
         "| `@bot review` | Incremental review of what changed since last review |",
-        "| `@bot full review` | Re-review the whole PR from scratch |",
-        "| `@bot summary` | Regenerate the walkthrough summary |",
+        "| `@bot full review` | Re-review the whole PR from scratch (resets the running totals) |",
+        "| `@bot summary` | Redraw the summary comment from stored state (no model call) |",
         "| `@bot resolve` | Resolve all AI review threads |",
         "| `@bot pause` / `@bot resume` | Stop / restart automatic reviews |",
         "| `@bot help` | Show this list |",
@@ -36074,88 +36083,59 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.findingId = findingId;
+exports.normalizeTitle = normalizeTitle;
+exports.legacySignature = legacySignature;
 exports.renderFindingBody = renderFindingBody;
+exports.extractAirId = extractAirId;
+exports.extractLegacyTitle = extractLegacyTitle;
 exports.buildInlineComments = buildInlineComments;
-exports.signature = signature;
-exports.existingCommentSignatures = existingCommentSignatures;
+exports.readExistingComments = readExistingComments;
 exports.postReview = postReview;
 exports.postIssueComment = postIssueComment;
 const core = __importStar(__nccwpck_require__(7484));
-const SEVERITY_META = {
-    potential_issue: { emoji: "⛔", label: "Potential issue" },
-    refactor: { emoji: "⚠️", label: "Refactor" },
-    nitpick: { emoji: "🔹", label: "Nitpick" },
-};
+const crypto_1 = __nccwpck_require__(6982);
+const AIR_ID_RE = /<!--\s*air-id:([0-9a-f]{8})\s*-->/;
+/**
+ * Stable identity for a finding, deliberately excluding the line number: the same
+ * defect drifts down the file as commits land above it, and we still want to
+ * recognise it as the same finding rather than post a duplicate.
+ */
+function findingId(path, title) {
+    return (0, crypto_1.createHash)("sha1")
+        .update(`${path}|${normalizeTitle(title)}`)
+        .digest("hex")
+        .slice(0, 8);
+}
+function normalizeTitle(title) {
+    return title.toLowerCase().replace(/\s+/g, " ").replace(/[.!?…]+$/, "").trim();
+}
+function legacySignature(path, line, title) {
+    return `${path}:${line}:${normalizeTitle(title)}`;
+}
 /** Render a finding into a review-comment body, with a committable suggestion when present. */
 function renderFindingBody(f) {
-    const { emoji, label } = SEVERITY_META[f.severity];
-    let body = `${emoji} **${label}** · _${f.category}_\n\n**${f.title}**\n\n${f.body}`;
+    let body = `**${f.severity}:** ${f.title}\n\n${f.body}`;
     if (f.suggestion && f.suggestion.trim().length > 0) {
         body += `\n\n\`\`\`suggestion\n${f.suggestion.replace(/\n+$/, "")}\n\`\`\``;
     }
-    return body;
+    return `${body}\n\n<!-- air-id:${findingId(f.path, f.title)} -->`;
+}
+/** Pull the air-id back out of a comment body we (or an earlier run) wrote. */
+function extractAirId(body) {
+    return body.match(AIR_ID_RE)?.[1] ?? null;
 }
 /**
- * Turn findings into GitHub inline comments, dropping any that don't anchor to a
- * commentable line (prevents 422s) and any that duplicate an existing bot comment
- * (prevents re-posting the same nit on every incremental run).
+ * Recover the title from a pre-air-id comment body. Handles both the original
+ * CodeRabbit-style layout (title alone on a `**bold**` line) and the current
+ * Kilo-style header (`**WARNING:** title`), so PRs reviewed by an older build
+ * still dedup instead of getting every comment re-posted once.
  */
-function buildInlineComments(findings, diffFiles, existingSignatures) {
-    const byPath = new Map(diffFiles.map((f) => [f.path, f.commentableLines]));
-    const comments = [];
-    let skipped = 0;
-    for (const f of findings) {
-        const commentable = byPath.get(f.path);
-        if (!commentable || !commentable.has(f.line)) {
-            skipped++;
-            continue;
-        }
-        if (existingSignatures.has(signature(f.path, f.line, f.title))) {
-            skipped++;
-            continue;
-        }
-        const comment = {
-            path: f.path,
-            body: renderFindingBody(f),
-            line: f.line,
-            side: "RIGHT",
-        };
-        if (f.end_line &&
-            f.end_line > f.line &&
-            commentable.has(f.end_line)) {
-            comment.start_line = f.line;
-            comment.start_side = "RIGHT";
-            comment.line = f.end_line; // GitHub: `line` is the LAST line of the range
-        }
-        comments.push(comment);
-    }
-    return { comments, skipped };
-}
-function signature(path, line, title) {
-    return `${path}:${line}:${title.trim().toLowerCase()}`;
-}
-/** Collect signatures of existing bot review comments so we can dedup. */
-async function existingCommentSignatures(octokit, repo, pull_number) {
-    const sigs = new Set();
-    try {
-        const comments = await octokit.paginate(octokit.rest.pulls.listReviewComments, { ...repo, pull_number, per_page: 100 });
-        for (const c of comments) {
-            const line = c.line ?? c.original_line;
-            const title = extractTitle(c.body ?? "");
-            if (c.path && line && title) {
-                sigs.add(signature(c.path, line, title));
-            }
-        }
-    }
-    catch (err) {
-        core.warning(`Could not list existing review comments: ${err.message}`);
-    }
-    return sigs;
-}
-/** Titles are rendered as **bold** on their own line — pull the first one back out. */
-function extractTitle(body) {
-    const lines = body.split("\n");
-    for (const l of lines) {
+function extractLegacyTitle(body) {
+    for (const l of body.split("\n")) {
+        const kilo = l.match(/^\*\*(?:CRITICAL|WARNING|SUGGESTION):\*\*\s*(.+)$/);
+        if (kilo)
+            return kilo[1];
         const m = l.match(/^\*\*(.+?)\*\*$/);
         if (m && !/^(Potential issue|Refactor|Nitpick)/i.test(m[1]))
             return m[1];
@@ -36163,19 +36143,98 @@ function extractTitle(body) {
     return null;
 }
 /**
+ * Turn findings into GitHub inline comments.
+ *
+ * Three outcomes per finding:
+ *  - `comments`   — anchors to a changed line and hasn't been posted before.
+ *  - `duplicates` — already has a live comment; skipped so incremental runs
+ *                   don't re-post the same note on every push.
+ *  - `unanchored` — the model's line isn't commentable. GitHub would 422 on
+ *                   these, but they're often real issues with a drifted line
+ *                   number, so instead of discarding them we demote them to
+ *                   "Other Observations" in the summary.
+ */
+function buildInlineComments(findings, diffFiles, existing) {
+    const byPath = new Map(diffFiles.map((f) => [f.path, f.commentableLines]));
+    const comments = [];
+    const unanchored = [];
+    const duplicates = [];
+    const seen = new Set();
+    for (const f of findings) {
+        const id = findingId(f.path, f.title);
+        if (seen.has(id) ||
+            existing.byId.has(id) ||
+            existing.legacy.has(legacySignature(f.path, f.line, f.title))) {
+            duplicates.push(f);
+            continue;
+        }
+        const commentable = byPath.get(f.path);
+        if (!commentable || !commentable.has(f.line)) {
+            unanchored.push(f);
+            continue;
+        }
+        seen.add(id);
+        const comment = {
+            path: f.path,
+            body: renderFindingBody(f),
+            line: f.line,
+            side: "RIGHT",
+        };
+        if (f.end_line && f.end_line > f.line && commentable.has(f.end_line)) {
+            comment.start_line = f.line;
+            comment.start_side = "RIGHT";
+            comment.line = f.end_line; // GitHub: `line` is the LAST line of the range
+        }
+        comments.push(comment);
+    }
+    return { comments, unanchored, duplicates };
+}
+/**
+ * Read back every review comment we've posted on this PR. This is both the dedup
+ * source and — via `outdated` — the signal that the author has changed the code a
+ * finding was anchored to, which is how findings drop off the summary once fixed.
+ */
+async function readExistingComments(octokit, repo, pull_number) {
+    const byId = new Map();
+    const legacy = new Set();
+    try {
+        const comments = await octokit.paginate(octokit.rest.pulls.listReviewComments, { ...repo, pull_number, per_page: 100 });
+        for (const c of comments) {
+            const body = c.body ?? "";
+            const line = c.line ?? c.original_line;
+            if (!c.path || !line)
+                continue;
+            const id = extractAirId(body);
+            if (id) {
+                byId.set(id, {
+                    commentId: c.id,
+                    line,
+                    outdated: c.position === null || c.position === undefined,
+                });
+                continue;
+            }
+            const title = extractLegacyTitle(body);
+            if (title)
+                legacy.add(legacySignature(c.path, line, title));
+        }
+    }
+    catch (err) {
+        core.warning(`Could not list existing review comments: ${err.message}`);
+    }
+    return { byId, legacy };
+}
+/**
  * Post the review. GitHub rejects the whole review if any single comment targets
- * an invalid line, so we submit comments individually-tolerant by pre-filtering,
- * and fall back to posting comments one-by-one if the batch call still fails.
+ * an invalid line, so we pre-filter to commentable lines and fall back to posting
+ * comments one-by-one if the batch call still fails.
+ *
+ * With no comments to post there is nothing to say here — the sticky summary
+ * comment carries the whole report — so we skip creating an empty review object
+ * rather than adding one to the timeline on every push.
  */
 async function postReview(octokit, repo, pull_number, commitId, summaryBody, comments) {
     if (comments.length === 0) {
-        await octokit.rest.pulls.createReview({
-            ...repo,
-            pull_number,
-            commit_id: commitId,
-            body: summaryBody,
-            event: "COMMENT",
-        });
+        core.info("No new inline comments; skipping review creation.");
         return;
     }
     try {
@@ -36235,84 +36294,160 @@ async function postIssueComment(octokit, repo, issue_number, body) {
 /***/ }),
 
 /***/ 8862:
-/***/ ((__unused_webpack_module, exports) => {
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
 
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.DEFAULT_STATE = exports.WALKTHROUGH_MARKER = void 0;
+exports.DEFAULT_STATE = exports.SUMMARY_MARKER = exports.COMMENT_LIMIT = exports.STATE_VERSION = void 0;
 exports.encodeState = encodeState;
 exports.parseState = parseState;
-exports.findWalkthroughComment = findWalkthroughComment;
+exports.findSummaryComment = findSummaryComment;
 exports.readState = readState;
-exports.writeWalkthrough = writeWalkthrough;
-const MARKER = "AI-REVIEWER-STATE";
-const MARKER_RE = /<!--\s*AI-REVIEWER-STATE\s+(\{.*?\})\s*-->/s;
-exports.WALKTHROUGH_MARKER = "<!-- AI-REVIEWER-WALKTHROUGH -->";
+exports.writeSummary = writeSummary;
+const core = __importStar(__nccwpck_require__(7484));
+const zlib_1 = __nccwpck_require__(3106);
+exports.STATE_VERSION = 2;
+/** GitHub's hard cap on an issue-comment body. */
+exports.COMMENT_LIMIT = 65536;
+/** Headroom for the markers, separators, and any server-side normalisation. */
+const SLACK = 2048;
+exports.SUMMARY_MARKER = "<!-- kilo-review -->";
+const STATE_RE = /<!--\s*AI-REVIEW-STATE\s+v2\s+([A-Za-z0-9+/=]+)\s*-->/;
+/* Markers written by earlier builds. We still *match* them so an open PR keeps
+ * updating its original comment instead of sprouting a second one, but we only
+ * ever *write* SUMMARY_MARKER + the v2 state marker. */
+const LEGACY_WALKTHROUGH_MARKER = "<!-- AI-REVIEWER-WALKTHROUGH -->";
+const LEGACY_STATE_RE = /<!--\s*AI-REVIEWER-STATE\s+(\{.*?\})\s*-->/s;
 exports.DEFAULT_STATE = {
+    v: exports.STATE_VERSION,
     lastReviewedSha: null,
     reviewCount: 0,
     paused: false,
+    tokens: 0,
+    model: "",
+    assessment: "",
+    findings: [],
+    observations: [],
+    files: [],
 };
+/**
+ * The payload is gzipped and base64'd rather than embedded as raw JSON. Findings
+ * quote real code, and a title containing `-->` would otherwise close the HTML
+ * comment early — corrupting the visible summary and leaking JSON into the page.
+ * Compression is a useful side effect: this data is highly repetitive.
+ */
 function encodeState(state) {
-    return `<!-- ${MARKER} ${JSON.stringify(state)} -->`;
+    const packed = (0, zlib_1.gzipSync)(Buffer.from(JSON.stringify(state), "utf8")).toString("base64");
+    return `<!-- AI-REVIEW-STATE v2 ${packed} -->`;
 }
 function parseState(body) {
     if (!body)
         return null;
-    const m = body.match(MARKER_RE);
-    if (!m)
-        return null;
-    try {
-        return { ...exports.DEFAULT_STATE, ...JSON.parse(m[1]) };
+    const v2 = body.match(STATE_RE);
+    if (v2) {
+        try {
+            const json = (0, zlib_1.gunzipSync)(Buffer.from(v2[1], "base64")).toString("utf8");
+            return { ...exports.DEFAULT_STATE, ...JSON.parse(json) };
+        }
+        catch (err) {
+            core.warning(`Could not decode review state: ${err.message}`);
+            return null;
+        }
     }
-    catch {
-        return null;
+    // v1: raw JSON with only lastReviewedSha/reviewCount/paused. Migrate so the PR
+    // keeps its incremental position instead of being reviewed from scratch.
+    const v1 = body.match(LEGACY_STATE_RE);
+    if (v1) {
+        try {
+            const legacy = JSON.parse(v1[1]);
+            core.info("Migrating v1 review state to v2.");
+            return { ...exports.DEFAULT_STATE, ...legacy, v: exports.STATE_VERSION };
+        }
+        catch {
+            return null;
+        }
     }
+    return null;
 }
-/** Find the bot's walkthrough comment (the one carrying the state marker). */
-async function findWalkthroughComment(octokit, repo, issue_number) {
+/** Find the bot's sticky summary comment, across every marker we've ever written. */
+async function findSummaryComment(octokit, repo, issue_number) {
     const comments = await octokit.paginate(octokit.rest.issues.listComments, {
         ...repo,
         issue_number,
         per_page: 100,
     });
-    const found = comments.find((c) => c.body?.includes(exports.WALKTHROUGH_MARKER) || c.body?.includes(MARKER));
+    const found = comments.find((c) => c.body?.includes(exports.SUMMARY_MARKER) ||
+        c.body?.includes("AI-REVIEW-STATE") ||
+        c.body?.includes(LEGACY_WALKTHROUGH_MARKER) ||
+        c.body?.includes("AI-REVIEWER-STATE"));
     return found ? { id: found.id, body: found.body ?? "" } : null;
 }
 async function readState(octokit, repo, issue_number) {
-    const comment = await findWalkthroughComment(octokit, repo, issue_number);
+    const comment = await findSummaryComment(octokit, repo, issue_number);
     return parseState(comment?.body) ?? { ...exports.DEFAULT_STATE };
 }
 /**
- * Upsert the walkthrough comment, embedding the (possibly updated) state marker.
- * Passing `body: null` keeps the existing visible walkthrough and only updates state
- * (used by pause/resume).
+ * Upsert the sticky summary comment.
+ *
+ * `render` is called with the number of characters actually available once the
+ * encoded state is accounted for, so the renderer can shrink its optional
+ * sections rather than have the whole write rejected by GitHub.
  */
-async function writeWalkthrough(octokit, repo, issue_number, body, state) {
-    const existing = await findWalkthroughComment(octokit, repo, issue_number);
-    const visible = body ?? stripMarkers(existing?.body ?? "") ?? "_No walkthrough yet._";
-    const full = `${exports.WALKTHROUGH_MARKER}\n${visible}\n\n${encodeState(state)}`;
+async function writeSummary(octokit, repo, issue_number, state, render) {
+    const marker = encodeState(state);
+    const budget = exports.COMMENT_LIMIT - marker.length - exports.SUMMARY_MARKER.length - SLACK;
+    let visible = render(Math.max(budget, 1000));
+    const full = `${exports.SUMMARY_MARKER}\n${visible}\n\n${marker}`;
+    if (full.length > exports.COMMENT_LIMIT) {
+        core.warning(`Summary comment is ${full.length} chars, over GitHub's ${exports.COMMENT_LIMIT} limit; hard-trimming.`);
+        visible = visible.slice(0, Math.max(budget, 1000));
+    }
+    const body = `${exports.SUMMARY_MARKER}\n${visible}\n\n${marker}`;
+    const existing = await findSummaryComment(octokit, repo, issue_number);
     if (existing) {
         await octokit.rest.issues.updateComment({
             ...repo,
             comment_id: existing.id,
-            body: full,
+            body,
         });
     }
     else {
-        await octokit.rest.issues.createComment({
-            ...repo,
-            issue_number,
-            body: full,
-        });
+        await octokit.rest.issues.createComment({ ...repo, issue_number, body });
     }
-}
-function stripMarkers(body) {
-    return body
-        .replace(exports.WALKTHROUGH_MARKER, "")
-        .replace(MARKER_RE, "")
-        .trim();
 }
 
 
@@ -36476,6 +36611,119 @@ run();
 
 /***/ }),
 
+/***/ 8028:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.toStoredFinding = toStoredFinding;
+exports.toStoredObservation = toStoredObservation;
+exports.findingToObservation = findingToObservation;
+exports.mergeFindings = mergeFindings;
+exports.mergeObservations = mergeObservations;
+exports.dropObservationsWithComments = dropObservationsWithComments;
+exports.observationKey = observationKey;
+exports.capFindings = capFindings;
+const types_1 = __nccwpck_require__(8522);
+const review_1 = __nccwpck_require__(6163);
+/** Table cells only ever show one line; the full prose lives in the inline comment. */
+const TEXT_CAP = 300;
+const MAX_FINDINGS = 200;
+const MAX_OBSERVATIONS = 50;
+function toStoredFinding(f) {
+    return {
+        id: (0, review_1.findingId)(f.path, f.title),
+        p: f.path,
+        l: f.line,
+        s: f.severity,
+        t: clamp(f.summary || f.title, TEXT_CAP),
+    };
+}
+function toStoredObservation(o) {
+    return { p: o.path, ...(o.line ? { l: o.line } : {}), n: clamp(o.note, TEXT_CAP) };
+}
+/**
+ * A finding the model anchored to a line that isn't in the diff. It's often a
+ * real issue with a drifted line number, so it becomes an observation rather
+ * than being thrown away — GitHub would reject it as an inline comment.
+ */
+function findingToObservation(f) {
+    return { p: f.path, l: f.line, n: clamp(f.summary || f.title, TEXT_CAP) };
+}
+/**
+ * Carry findings forward across commits.
+ *
+ * A stored finding is dropped when GitHub reports its comment as outdated —
+ * that means the author edited the code it was anchored to, so it counts as
+ * addressed. Surviving findings have their line refreshed from GitHub, which is
+ * what keeps the summary table accurate as later commits shift lines around.
+ */
+function mergeFindings(prev, fresh, tracked) {
+    const kept = new Map();
+    const expired = [];
+    for (const f of prev) {
+        const status = tracked.get(f.id);
+        if (status?.outdated) {
+            expired.push(f);
+            continue;
+        }
+        kept.set(f.id, status ? { ...f, l: status.line, c: status.commentId } : f);
+    }
+    // Fresh results win — and re-add anything we just expired that is still real.
+    for (const f of fresh) {
+        const status = tracked.get(f.id);
+        kept.set(f.id, status ? { ...f, l: status.line, c: status.commentId } : f);
+    }
+    return { findings: capFindings([...kept.values()]), expired };
+}
+/**
+ * Observations have no review comment to track, so staleness can only be judged
+ * at file granularity: if this run re-read the file and didn't repeat the note,
+ * we drop it. That's the honest limit of what we can know here.
+ */
+function mergeObservations(prev, fresh, reviewedPaths) {
+    const byKey = new Map();
+    for (const o of prev) {
+        if (reviewedPaths.has(o.p))
+            continue;
+        byKey.set(observationKey(o), o);
+    }
+    for (const o of fresh)
+        byKey.set(observationKey(o), o);
+    return [...byKey.values()].slice(0, MAX_OBSERVATIONS);
+}
+/** Don't repeat in "Other Observations" something already posted as an inline comment. */
+function dropObservationsWithComments(observations, findings) {
+    const anchored = new Set(findings.map((f) => `${f.p}:${f.l}`));
+    return observations.filter((o) => !anchored.has(`${o.p}:${o.l ?? ""}`));
+}
+function observationKey(o) {
+    return `${o.p}:${o.l ?? "-"}:${(0, review_1.normalizeTitle)(o.n).slice(0, 80)}`;
+}
+/**
+ * Keep the state marker inside GitHub's comment-size cap. Severity order is the
+ * eviction order, so a CRITICAL finding is never dropped to make room for a
+ * SUGGESTION.
+ */
+function capFindings(findings) {
+    if (findings.length <= MAX_FINDINGS)
+        return findings;
+    const ranked = [...findings].sort((a, b) => types_1.SEVERITIES.indexOf(a.s) - types_1.SEVERITIES.indexOf(b.s));
+    return ranked.slice(0, MAX_FINDINGS);
+}
+function clamp(s, max) {
+    const flat = s.replace(/\s*\n\s*/g, " ").trim();
+    if (flat.length <= max)
+        return flat;
+    const cut = flat.slice(0, max);
+    const space = cut.lastIndexOf(" ");
+    return `${space > max * 0.6 ? cut.slice(0, space) : cut}…`;
+}
+
+
+/***/ }),
+
 /***/ 6410:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -36532,20 +36780,28 @@ const ALWAYS_IGNORE = [
 ];
 /** Apply path filters, drop noise/binary/deleted files, and cap to max_files. */
 function selectFiles(diffFiles, config) {
-    const excludes = [...ALWAYS_IGNORE, ...extractNegated(config.path_filters)];
+    const userExcludes = extractNegated(config.path_filters);
     const includes = extractPositive(config.path_filters);
-    let skippedByFilter = 0;
+    const dropped = [];
     const kept = diffFiles.filter((f) => {
-        if (f.isBinary || f.isDeleted || f.commentableLines.size === 0) {
-            skippedByFilter++;
+        if (f.isDeleted) {
+            dropped.push({ path: f.path, reason: "deleted" });
             return false;
         }
-        if (excludes.some((g) => (0, minimatch_1.minimatch)(f.path, g))) {
-            skippedByFilter++;
+        if (f.isBinary || f.commentableLines.size === 0) {
+            dropped.push({ path: f.path, reason: "binary" });
+            return false;
+        }
+        if (ALWAYS_IGNORE.some((g) => (0, minimatch_1.minimatch)(f.path, g))) {
+            dropped.push({ path: f.path, reason: "generated" });
+            return false;
+        }
+        if (userExcludes.some((g) => (0, minimatch_1.minimatch)(f.path, g))) {
+            dropped.push({ path: f.path, reason: "filtered" });
             return false;
         }
         if (includes.length && !includes.some((g) => (0, minimatch_1.minimatch)(f.path, g))) {
-            skippedByFilter++;
+            dropped.push({ path: f.path, reason: "filtered" });
             return false;
         }
         return true;
@@ -36553,11 +36809,19 @@ function selectFiles(diffFiles, config) {
     // Largest changes first, so if we hit the cap we review the most substantial files.
     kept.sort((a, b) => b.additions + b.deletions - (a.additions + a.deletions));
     const files = kept.slice(0, config.max_files);
+    for (const f of kept.slice(config.max_files)) {
+        dropped.push({ path: f.path, reason: "cap" });
+    }
     const skippedByCap = kept.length - files.length;
     if (skippedByCap > 0) {
         core.warning(`${skippedByCap} file(s) exceeded max_files=${config.max_files} and were not reviewed.`);
     }
-    return { files, skippedByFilter, skippedByCap };
+    return {
+        files,
+        dropped,
+        skippedByFilter: dropped.length - skippedByCap,
+        skippedByCap,
+    };
 }
 function extractNegated(filters) {
     return filters.filter((f) => f.startsWith("!")).map((f) => f.slice(1));
@@ -36664,6 +36928,8 @@ const core = __importStar(__nccwpck_require__(7484));
 const sdk_1 = __importDefault(__nccwpck_require__(121));
 const types_1 = __nccwpck_require__(8522);
 const TOOL_NAME = "submit_review";
+/** Dense finding bodies plus observations plus the assessment outgrow 8k fast. */
+const MAX_TOKENS = 16000;
 class ReviewEngine {
     model;
     client;
@@ -36706,38 +36972,73 @@ class ReviewEngine {
     async call(system, messages) {
         const response = await this.client.messages.create({
             model: this.model,
-            max_tokens: 8000,
+            max_tokens: MAX_TOKENS,
             system,
             tools: [
                 {
                     name: TOOL_NAME,
-                    description: "Submit the structured code review (walkthrough, changed files, and line-anchored findings).",
+                    description: "Submit the structured code review (overall assessment, line-anchored findings, and out-of-diff observations).",
                     input_schema: types_1.REVIEW_TOOL_SCHEMA,
                 },
             ],
             tool_choice: { type: "tool", name: TOOL_NAME },
             messages,
         });
+        const usage = readUsage(response);
+        if (response.stop_reason === "max_tokens") {
+            core.warning(`Model hit the ${MAX_TOKENS}-token output cap; the review may be incomplete. Consider lowering max_files or splitting the PR.`);
+        }
         const toolUse = response.content.find((c) => c.type === "tool_use");
         if (!toolUse) {
             throw new Error("Model did not return a submit_review tool call.");
         }
         const parsed = types_1.ReviewResultSchema.safeParse(toolUse.input);
-        if (!parsed.success) {
-            core.warning(`Model output failed validation: ${parsed.error.issues
-                .map((i) => i.message)
-                .join("; ")}`);
-            // Best-effort salvage: coerce with defaults.
-            return types_1.ReviewResultSchema.parse({
-                walkthrough: toolUse.input?.walkthrough ?? "Review completed.",
-                changed_files: toolUse.input?.changed_files ?? [],
-                findings: [],
-            });
-        }
-        return parsed.data;
+        if (parsed.success)
+            return { result: parsed.data, usage };
+        core.warning(`Model output failed validation: ${parsed.error.issues
+            .map((i) => i.message)
+            .join("; ")}`);
+        return { result: salvage(toolUse.input), usage };
     }
 }
 exports.ReviewEngine = ReviewEngine;
+/**
+ * A truncated or malformed tool call used to be discarded wholesale, which
+ * reported a clean PR when the model had actually found problems. Keep every
+ * finding that validates individually and drop only the ones that don't.
+ */
+function salvage(input) {
+    const raw = (input ?? {});
+    const findings = Array.isArray(raw.findings)
+        ? raw.findings.flatMap((f) => {
+            const one = types_1.FindingSchema.safeParse(f);
+            return one.success ? [one.data] : [];
+        })
+        : [];
+    if (findings.length > 0) {
+        core.warning(`Salvaged ${findings.length} finding(s) from a partial response.`);
+    }
+    return types_1.ReviewResultSchema.parse({
+        overall_assessment: typeof raw.overall_assessment === "string" ? raw.overall_assessment : "",
+        findings,
+        observations: [],
+    });
+}
+/**
+ * z.ai's Anthropic-compatible endpoint doesn't always populate the cache fields,
+ * so every component is read defensively and the total may legitimately be 0.
+ */
+function readUsage(response) {
+    const u = response.usage ?? {};
+    const input = num(u.input_tokens) +
+        num(u.cache_creation_input_tokens) +
+        num(u.cache_read_input_tokens);
+    const output = num(u.output_tokens);
+    return { input, output, total: input + output };
+}
+function num(v) {
+    return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
 
 
 /***/ }),
@@ -36790,20 +37091,37 @@ const context_1 = __nccwpck_require__(3823);
 const scope_1 = __nccwpck_require__(8324);
 const chunker_1 = __nccwpck_require__(6410);
 const prompts_1 = __nccwpck_require__(7963);
+const render_1 = __nccwpck_require__(746);
+const accumulate_1 = __nccwpck_require__(8028);
 async function runReview(octokit, repo, pull_number, config, engine, opts) {
     const pr = await (0, context_1.getPrDetails)(octokit, repo, pull_number);
-    const state = await (0, state_1.readState)(octokit, repo, pull_number);
-    const scope = await (0, scope_1.resolveScope)(octokit, repo, pr, state, opts.forceFull);
+    const prev = await (0, state_1.readState)(octokit, repo, pull_number);
+    // `@bot summary` just redraws the sticky comment from what we already know —
+    // no diff, no model call, no tokens.
+    if (opts.summaryOnly) {
+        await publishSummary(octokit, repo, pr, prev, engine.model);
+        core.info("Re-rendered the summary comment from stored state.");
+        return;
+    }
+    // A full review rebuilds the totals from scratch; that's the escape hatch if
+    // accumulation ever drifts.
+    const base = opts.forceFull
+        ? { ...prev, findings: [], observations: [], files: [] }
+        : prev;
+    const scope = await (0, scope_1.resolveScope)(octokit, repo, pr, prev, opts.forceFull);
     if (!scope.hasChanges) {
         core.info("No reviewable changes in scope. Nothing to do.");
-        await bumpState(octokit, repo, pr, state, null);
+        await publishSummary(octokit, repo, pr, advance(base, pr, 0, false), engine.model);
         return;
     }
     const allFiles = (0, diff_1.parseDiffFiles)(scope.diffText);
-    const { files, skippedByFilter, skippedByCap } = (0, chunker_1.selectFiles)(allFiles, config);
+    const { files, dropped, skippedByCap } = (0, chunker_1.selectFiles)(allFiles, config);
     if (files.length === 0) {
         core.info("All changed files were filtered out. Nothing to review.");
-        await bumpState(octokit, repo, pr, state, null);
+        const roster = (0, render_1.buildRoster)(allFiles.map((f) => f.path), new Map(dropped.map((d) => [d.path, d.reason])), new Map());
+        const next = advance(base, pr, 0, false);
+        next.files = (0, render_1.mergeRoster)(base.files, roster);
+        await publishSummary(octokit, repo, pr, next, engine.model);
         return;
     }
     const linkedIssues = await (0, context_1.getLinkedIssues)(octokit, repo, pr.body);
@@ -36817,77 +37135,98 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
         incremental: scope.kind === "incremental",
     }, files, config);
     core.info(`Reviewing ${files.length} file(s) [${scope.kind}] with ${config.profile} profile…`);
-    let result = await engine.review(system, user);
+    const draft = await engine.review(system, user);
+    let result = draft.result;
+    let tokens = draft.usage.total;
     if (config.verification && result.findings.length > 0) {
         core.info(`Verifying ${result.findings.length} finding(s)…`);
         try {
-            result = await engine.verify((0, prompts_1.verificationPrompt)(), user, result);
+            const verified = await engine.verify((0, prompts_1.verificationPrompt)(), user, result);
+            tokens += verified.usage.total;
+            // The verify pass returns a whole fresh result, so anything the model
+            // forgot to echo back would otherwise be silently lost.
+            result = {
+                overall_assessment: verified.result.overall_assessment.trim() ||
+                    draft.result.overall_assessment,
+                findings: verified.result.findings,
+                observations: verified.result.observations.length
+                    ? verified.result.observations
+                    : draft.result.observations,
+            };
         }
         catch (err) {
             core.warning(`Verification pass failed (${err.message}); keeping draft.`);
         }
     }
-    const existing = scope.kind === "incremental"
-        ? await (0, review_1.existingCommentSignatures)(octokit, repo, pull_number)
-        : new Set();
-    const { comments, skipped } = (0, review_1.buildInlineComments)(result.findings, files, existing);
-    const summary = renderSummary(result, scope.kind, {
-        reviewed: files.length,
-        findings: comments.length,
-        skippedByFilter,
-        skippedByCap,
-        skippedUnanchored: skipped,
-    });
-    if (!opts.summaryOnly) {
-        await (0, review_1.postReview)(octokit, repo, pull_number, pr.headSha, summary, comments);
-    }
-    const walkthrough = renderWalkthrough(result, scope.kind);
-    await bumpState(octokit, repo, pr, state, walkthrough);
-    core.info(`Done. Posted ${comments.length} inline comment(s); skipped ${skipped}.`);
-}
-async function bumpState(octokit, repo, pr, prev, walkthrough) {
-    const next = {
-        lastReviewedSha: pr.headSha,
-        reviewCount: prev.reviewCount + (walkthrough ? 1 : 0),
-        paused: prev.paused,
-    };
-    await (0, state_1.writeWalkthrough)(octokit, repo, pr.number, walkthrough, next);
-}
-function renderSummary(result, kind, stats) {
-    const lines = [
-        `**AI review (${kind})** — reviewed ${stats.reviewed} file(s), ${stats.findings} comment(s).`,
+    // Always read existing comments, including on full runs — GitHub does not
+    // dedupe, so skipping this re-posts every comment on `@bot full review`.
+    const existing = await (0, review_1.readExistingComments)(octokit, repo, pull_number);
+    const { comments, unanchored, duplicates } = (0, review_1.buildInlineComments)(result.findings, files, existing);
+    await (0, review_1.postReview)(octokit, repo, pull_number, pr.headSha, reviewBody(files.length, pr.headSha, comments.length), comments);
+    /* ---- fold this run into the running totals ---- */
+    const reviewedPaths = new Set(files.map((f) => f.path));
+    const freshFindings = result.findings
+        .filter((f) => !unanchored.includes(f))
+        .map(accumulate_1.toStoredFinding);
+    const { findings, expired } = (0, accumulate_1.mergeFindings)(base.findings, freshFindings, existing.byId);
+    const freshObservations = [
+        ...result.observations.map(accumulate_1.toStoredObservation),
+        ...unanchored.map(accumulate_1.findingToObservation),
     ];
-    if (stats.skippedByCap > 0) {
-        lines.push(`> ⚠️ ${stats.skippedByCap} file(s) skipped (over \`max_files\`). Raise the limit or split the PR.`);
-    }
-    const counts = countBySeverity(result.findings);
-    if (stats.findings > 0) {
-        lines.push(`\n${counts.potential_issue} potential issue(s) · ${counts.refactor} refactor(s) · ${counts.nitpick} nitpick(s).`);
-    }
-    else {
-        lines.push("\nNo blocking issues found. 🐰");
-    }
-    return lines.join("\n");
+    const observations = (0, accumulate_1.dropObservationsWithComments)((0, accumulate_1.mergeObservations)(base.observations, freshObservations, reviewedPaths), findings);
+    const issueCounts = new Map();
+    for (const f of findings)
+        issueCounts.set(f.p, (issueCounts.get(f.p) ?? 0) + 1);
+    const roster = (0, render_1.applyIssueCounts)((0, render_1.mergeRoster)(base.files, (0, render_1.buildRoster)(allFiles.map((f) => f.path), new Map(dropped.map((d) => [d.path, d.reason])), issueCounts)), findings);
+    const next = advance(base, pr, tokens, true);
+    next.findings = findings;
+    next.observations = observations;
+    next.files = roster;
+    next.assessment = result.overall_assessment.trim() || base.assessment;
+    await publishSummary(octokit, repo, pr, next, engine.model);
+    core.info(`Done. ${comments.length} new comment(s), ${duplicates.length} duplicate(s) skipped, ` +
+        `${unanchored.length} demoted to observations, ${expired.length} expired. ` +
+        `Totals: ${findings.length} finding(s) across ${roster.length} file(s)` +
+        (skippedByCap > 0 ? `; ${skippedByCap} file(s) over max_files` : "") +
+        ".");
 }
-function renderWalkthrough(result, kind) {
-    const parts = [`## 🐰 AI Review — Walkthrough`, "", result.walkthrough];
-    if (result.changed_files.length) {
-        parts.push("\n### Changed files");
-        parts.push("| File | Summary |", "| --- | --- |");
-        for (const f of result.changed_files) {
-            parts.push(`| \`${f.path}\` | ${f.summary.replace(/\|/g, "\\|")} |`);
-        }
-    }
-    parts.push(`\n<sub>Last review: ${kind}. Push a commit for an incremental re-review, or comment \`@bot help\`.</sub>`);
-    return parts.join("\n");
-}
-function countBySeverity(findings) {
+/** Bump the counters that advance regardless of what the review found. */
+function advance(base, pr, tokens, counted) {
     return {
-        potential_issue: findings.filter((f) => f.severity === "potential_issue")
-            .length,
-        refactor: findings.filter((f) => f.severity === "refactor").length,
-        nitpick: findings.filter((f) => f.severity === "nitpick").length,
+        ...base,
+        lastReviewedSha: pr.headSha,
+        reviewCount: base.reviewCount + (counted ? 1 : 0),
+        tokens: base.tokens + tokens,
     };
+}
+/**
+ * Render and upsert the sticky comment. The state marker shares the comment body
+ * with the rendered block, so the renderer is handed whatever space is left.
+ */
+async function publishSummary(octokit, repo, pr, state, model) {
+    const next = { ...state, model };
+    await (0, state_1.writeSummary)(octokit, repo, pr.number, next, (budget) => {
+        const { body, degradation, dropped } = (0, render_1.renderSummaryComment)({
+            findings: next.findings,
+            observations: next.observations,
+            files: next.files,
+            assessment: next.assessment,
+            model,
+            tokens: next.tokens,
+        }, budget);
+        if (degradation !== "none") {
+            core.warning(`Summary shrunk to fit GitHub's comment limit (level: ${degradation}${dropped ? `, ${dropped} row(s) hidden` : ""}).`);
+        }
+        return body;
+    });
+}
+/**
+ * The review object exists only to carry the inline comments; the full report
+ * lives in the sticky comment so it can be updated in place on every push.
+ */
+function reviewBody(reviewed, headSha, comments) {
+    const noun = comments === 1 ? "comment" : "comments";
+    return `Reviewed ${reviewed} file(s) at \`${headSha.slice(0, 7)}\` — ${comments} new inline ${noun}. See the **Code Review Summary** comment for the full report.`;
 }
 
 
@@ -36903,23 +37242,55 @@ exports.buildSystemPrompt = buildSystemPrompt;
 exports.buildUserPrompt = buildUserPrompt;
 exports.verificationPrompt = verificationPrompt;
 const PROFILE_GUIDANCE = {
-    quiet: "Only report genuine bugs, security issues, and correctness problems. Do NOT report style or nitpicks.",
-    chill: "Report bugs, security, performance, and clear correctness issues. Include high-value refactors. Keep nitpicks rare.",
-    assertive: "Report bugs, security, performance, correctness, refactors, and style nitpicks. Be thorough.",
+    quiet: "Report CRITICAL and WARNING only. Do not report SUGGESTION findings at all.",
+    chill: "Report CRITICAL and WARNING thoroughly. Keep SUGGESTION findings rare — only when the payoff is obvious.",
+    assertive: "Report all three levels, including SUGGESTION. Be thorough.",
 };
+/**
+ * The one-shot exemplar below matters more than any rule in this prompt: it is
+ * what actually moves a model from "Consider adding error handling here." to a
+ * body that traces a concrete failure path.
+ */
+const BODY_EXEMPLAR = [
+    "Example of the required body quality:",
+    "",
+    "> `confirmReview` catches `on AppFailure` and `catch (e, st)` but does not handle",
+    "> `on SessionExpiredException` explicitly — unlike `fetchSalesData`, `updateRecord`, and",
+    "> `deleteRecord` in this same provider. A `SessionExpiredException` will fall through to the",
+    "> generic `catch (e, st)`, get passed to `showFromException` (which silently returns for session",
+    "> expiry), then `rethrow` propagates it to the caller's `catch (_)` which swallows it. This",
+    "> breaks the consistent error-handling pattern used elsewhere.",
+    "",
+    "Unacceptable, for contrast: \"Consider adding error handling here.\" — it names nothing, traces",
+    "nothing, and could have been written without reading the code.",
+].join("\n");
 function buildSystemPrompt(config) {
     return [
         "You are a senior software engineer performing a rigorous but pragmatic code review of a pull request.",
         "Read the change the way its author would explain it, then find real problems.",
         "",
-        "Rules:",
-        "- ONLY comment on lines that appear in the provided diff. Each line is prefixed with its line number in the NEW file; use that exact number in `line`.",
-        "- Every finding must explain WHY it matters, not just what it is.",
-        "- Prefer a concrete `suggestion` (replacement code) whenever the fix is mechanical.",
-        "- Severity: `potential_issue` = likely bug/security; `refactor` = risk/maintainability; `nitpick` = minor polish.",
-        `- Profile: ${PROFILE_GUIDANCE[config.profile]}`,
-        "- Do not invent issues. If the code is fine, return an empty findings array.",
-        "- Write a clear `walkthrough` summarizing the PR, and one `changed_files` entry per meaningful file.",
+        "## Severity",
+        "- `CRITICAL` — the change causes incorrect behaviour, data loss, a security hole, a crash, or breaks a documented contract, on a path that will actually be taken. Merging is unsafe.",
+        "- `WARNING` — a real defect or risk under a plausible condition: an unhandled error path, a race, a resource leak, a performance cliff, or an inconsistency with the pattern the rest of the file follows. Should be fixed before merge.",
+        "- `SUGGESTION` — no correctness impact: naming, redundancy, dead code, clearer structure, missing coverage.",
+        "If you cannot name the concrete input or state that triggers the problem, it is at most a `SUGGESTION`.",
+        `Profile: ${PROFILE_GUIDANCE[config.profile]}`,
+        "",
+        "## Where a finding may point",
+        "- A `finding` MUST anchor to a line shown in the diff. Each diff line is prefixed with its line number in the NEW file — use that exact number in `line`.",
+        "- If you notice a real problem in code you can see but that is NOT a changed line, put it in `observations` instead. Do not force it into `findings` with an approximate line number.",
+        "",
+        "## Writing a finding",
+        "- `title`: a specific noun phrase naming the defect, at most ~8 words, no trailing period, no severity prefix. It renders directly after `**WARNING:**`.",
+        "- `summary`: ONE line giving the problem and its consequence. It renders inside a markdown table cell, so no newlines and no `|`.",
+        "- `body`: 3–6 sentences, one paragraph, no bullets and no headings. Name every symbol involved in backticks — function, class, variable, exception type, field. Trace the concrete failure path in order: which call leads to which state leads to which consequence. When the file already has an established pattern for this case, name the specific siblings that follow it. End with the user-visible or data-visible consequence. Never restate the title and never give generic advice.",
+        "- `suggestion`: include ONLY when the fix is a mechanical whole-line replacement of exactly the lines `[line..end_line]`. Give the replacement lines alone, no fences. A wrong suggestion is worse than none — omit it when unsure.",
+        "",
+        BODY_EXEMPLAR,
+        "",
+        "## Also required",
+        "- `overall_assessment`: 2–5 sentences judging the change as a whole — name the patterns it introduces, say whether the design is sound, and end by characterising what the issues amount to. Do not re-enumerate the individual findings.",
+        "- Do not invent issues. If the code is fine, return an empty `findings` array and say so in the assessment.",
         "",
         "Return your review by calling the `submit_review` tool. Do not write prose outside the tool call.",
     ].join("\n");
@@ -36963,8 +37334,246 @@ function verificationPrompt() {
     return [
         "You are verifying draft review findings to remove false positives.",
         "For each finding, decide if it is a real, actionable issue that is actually supported by the shown code and anchored to a changed line.",
-        "Return the `submit_review` tool call again containing ONLY the findings that survive. Keep their fields intact. Drop anything speculative, duplicated, or not grounded in the diff.",
+        "Return the `submit_review` tool call again containing ONLY the findings that survive. Drop anything speculative, duplicated, or not grounded in the diff.",
+        "Keep the surviving findings' fields intact, and re-check each `body` against the quality contract — if a body is thin or generic, rewrite it to name the symbols and trace the failure path rather than dropping the finding.",
+        "Preserve `overall_assessment` and `observations` unchanged unless a finding you dropped was also wrong there.",
     ].join("\n");
+}
+
+
+/***/ }),
+
+/***/ 746:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.countBySeverity = countBySeverity;
+exports.renderStatusLine = renderStatusLine;
+exports.renderOverviewTable = renderOverviewTable;
+exports.renderIssueDetails = renderIssueDetails;
+exports.renderObservations = renderObservations;
+exports.renderFileRoster = renderFileRoster;
+exports.inferKind = inferKind;
+exports.buildRoster = buildRoster;
+exports.mergeRoster = mergeRoster;
+exports.applyIssueCounts = applyIssueCounts;
+exports.fileLabel = fileLabel;
+exports.renderSummaryComment = renderSummaryComment;
+exports.formatCount = formatCount;
+const types_1 = __nccwpck_require__(8522);
+const DEGRADATIONS = [
+    "none",
+    "roster",
+    "observations",
+    "findings",
+];
+const KIND_LABEL = {
+    asset: "asset file",
+    generated: "generated file",
+    filtered: "excluded by path_filters",
+    cap: "not reviewed (max_files)",
+    binary: "binary file",
+    deleted: "deleted",
+};
+function countBySeverity(findings) {
+    const counts = { CRITICAL: 0, WARNING: 0, SUGGESTION: 0 };
+    for (const f of findings)
+        counts[f.s]++;
+    return counts;
+}
+function renderStatusLine(counts) {
+    const total = counts.CRITICAL + counts.WARNING + counts.SUGGESTION;
+    if (total === 0) {
+        return "**Status:** No Issues Found | **Recommendation:** Approve";
+    }
+    const recommendation = counts.CRITICAL > 0
+        ? "Do not merge — critical issues"
+        : counts.WARNING > 0
+            ? "Address before merge"
+            : "Safe to merge — suggestions only";
+    const noun = total === 1 ? "Issue" : "Issues";
+    return `**Status:** ${total} ${noun} Found | **Recommendation:** ${recommendation}`;
+}
+function renderOverviewTable(counts) {
+    return [
+        "### Overview",
+        "| Severity | Count |",
+        "|----------|-------|",
+        ...types_1.SEVERITIES.map((s) => `| ${s} | ${counts[s]} |`),
+    ].join("\n");
+}
+/** Issue tables grouped CRITICAL → WARNING → SUGGESTION. Empty groups are omitted. */
+function renderIssueDetails(findings) {
+    if (findings.length === 0)
+        return "";
+    const sections = [];
+    for (const severity of types_1.SEVERITIES) {
+        const group = findings.filter((f) => f.s === severity);
+        if (group.length === 0)
+            continue;
+        sections.push(`#### ${severity}`, "| File | Line | Issue |", "|------|------|-------|", ...group.map((f) => `| \`${f.p}\` | ${f.l} | ${cell(f.t)} |`), "");
+    }
+    return details("Issue Details (click to expand)", sections.join("\n").trim());
+}
+function renderObservations(observations) {
+    if (observations.length === 0)
+        return "";
+    return details("Other Observations (not in diff)", [
+        "| File | Line | Issue |",
+        "|------|------|-------|",
+        ...observations.map((o) => `| \`${o.p}\` | ${o.l ?? "—"} | ${cell(o.n)} |`),
+    ].join("\n"));
+}
+function renderFileRoster(files) {
+    if (files.length === 0)
+        return "";
+    const sorted = [...files].sort((a, b) => a.p.localeCompare(b.p));
+    const noun = files.length === 1 ? "file" : "files";
+    return details(`Files Reviewed (${files.length} ${noun})`, sorted.map((f) => `- \`${f.p}\` - ${fileLabel(f)}`).join("\n"));
+}
+const ASSET_RE = /\.(png|jpe?g|gif|svg|webp|ico|ttf|otf|woff2?|mp3|mp4|wav|lottie)$/i;
+const GENERATED_RE = /(\.g\.dart|\.freezed\.dart|\.pb\.go|\.generated\.[a-z]+|__generated__\/|\.min\.(js|css))$/i;
+/**
+ * Classify a file we *did* review but found nothing in, so the roster can say
+ * "asset file" rather than a misleading "0 issues" for things nobody reviews.
+ */
+function inferKind(path) {
+    if (GENERATED_RE.test(path))
+        return "generated";
+    if (ASSET_RE.test(path))
+        return "asset";
+    if (/(^|\/)assets\//i.test(path) && !/\.(dart|ts|tsx|js|jsx)$/i.test(path)) {
+        return "asset";
+    }
+    return "code";
+}
+/**
+ * Build the Files Reviewed roster for one run. A file that was dropped before
+ * reaching the model is labelled with *why*; a reviewed file gets its issue
+ * count, unless it's really an asset and the count would be noise.
+ */
+function buildRoster(changedPaths, droppedKinds, issueCounts) {
+    const roster = [];
+    for (const p of new Set(changedPaths)) {
+        const dropped = droppedKinds.get(p);
+        if (dropped) {
+            roster.push({ p, k: dropped });
+            continue;
+        }
+        const n = issueCounts.get(p) ?? 0;
+        const inferred = inferKind(p);
+        roster.push(n === 0 && inferred !== "code" ? { p, k: inferred } : { p, k: "code", n });
+    }
+    return roster;
+}
+/**
+ * Union the roster across runs: this run's classification wins for files it
+ * touched, earlier runs supply the files it didn't. Counts are NOT merged here —
+ * they're recomputed from the accumulated findings by `applyIssueCounts`, since
+ * summing per-run counts would double-count a finding re-reported on a later push.
+ */
+function mergeRoster(prev, next) {
+    const byPath = new Map(prev.map((f) => [f.p, f]));
+    for (const f of next)
+        byPath.set(f.p, f);
+    return [...byPath.values()];
+}
+/** Recompute every `code` entry's issue count from the current finding set. */
+function applyIssueCounts(roster, findings) {
+    const counts = new Map();
+    for (const f of findings)
+        counts.set(f.p, (counts.get(f.p) ?? 0) + 1);
+    return roster.map((f) => {
+        const n = counts.get(f.p) ?? 0;
+        // A file that has findings is code by definition, whatever we guessed before.
+        if (n > 0)
+            return { ...f, k: "code", n };
+        return f.k === "code" ? { ...f, n: 0 } : f;
+    });
+}
+function fileLabel(f) {
+    if (f.k !== "code")
+        return KIND_LABEL[f.k];
+    const n = f.n ?? 0;
+    return `${n} ${n === 1 ? "issue" : "issues"}`;
+}
+/**
+ * Render the whole block, shrinking it if it would blow past `budget` chars.
+ * Returns which degradation was applied so the caller can warn — we never
+ * truncate silently.
+ */
+function renderSummaryComment(input, budget = Infinity) {
+    let last = { body: "", degradation: "none", dropped: 0 };
+    for (const degradation of DEGRADATIONS) {
+        last = build(input, degradation);
+        if (last.body.length <= budget)
+            return last;
+    }
+    return last; // even the most degraded form is over budget — caller decides
+}
+function build(input, degradation) {
+    const counts = countBySeverity(input.findings);
+    let dropped = 0;
+    const parts = [
+        "## Code Review Summary",
+        "",
+        renderStatusLine(counts),
+        "",
+        renderOverviewTable(counts),
+    ];
+    let findings = input.findings;
+    if (degradation === "findings" && findings.length > FINDINGS_CAP) {
+        dropped = findings.length - FINDINGS_CAP;
+        findings = findings.slice(0, FINDINGS_CAP);
+    }
+    const issues = renderIssueDetails(findings);
+    if (issues) {
+        parts.push("", issues);
+        if (dropped > 0)
+            parts.push("", `_…and ${dropped} more issue(s)._`);
+    }
+    let observations = input.observations;
+    if ((degradation === "observations" || degradation === "findings") &&
+        observations.length > OBSERVATIONS_CAP) {
+        const cut = observations.length - OBSERVATIONS_CAP;
+        observations = observations.slice(0, OBSERVATIONS_CAP);
+        dropped += cut;
+    }
+    const obs = renderObservations(observations);
+    if (obs)
+        parts.push("", obs);
+    if (degradation === "none") {
+        const roster = renderFileRoster(input.files);
+        if (roster)
+            parts.push("", roster);
+    }
+    else if (input.files.length > 0) {
+        const noun = input.files.length === 1 ? "file" : "files";
+        parts.push("", `_Reviewed ${input.files.length} ${noun}._`);
+    }
+    if (input.assessment.trim()) {
+        parts.push("", "---", "", `**Overall Assessment:** ${input.assessment.trim()}`);
+    }
+    const credit = input.tokens > 0
+        ? `Reviewed by ${input.model} · ${formatCount(input.tokens)} tokens`
+        : `Reviewed by ${input.model}`;
+    parts.push("", "---", "<sub>`@bot review` · `@bot full review` · `@bot resolve` · `@bot help`</sub>", `<sub>${credit}</sub>`);
+    return { body: parts.join("\n"), degradation, dropped };
+}
+/** Locale-independent thousands separators, so snapshots don't depend on ICU. */
+function formatCount(n) {
+    return String(Math.max(0, Math.round(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+const FINDINGS_CAP = 50;
+const OBSERVATIONS_CAP = 20;
+function details(summary, body) {
+    return `<details>\n<summary><b>${summary}</b></summary>\n\n${body}\n\n</details>`;
+}
+/** Markdown table cells can't contain pipes or newlines. */
+function cell(text) {
+    return text.replace(/\s*\n\s*/g, " ").replace(/\|/g, "\\|").trim();
 }
 
 
@@ -37056,7 +37665,7 @@ async function resolveScope(octokit, repo, pr, state, forceFull) {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.REVIEW_TOOL_SCHEMA = exports.ReviewResultSchema = exports.ChangedFileSchema = exports.FindingSchema = exports.CATEGORIES = exports.SEVERITIES = exports.ConfigSchema = exports.AutoReviewSchema = exports.PathInstructionSchema = void 0;
+exports.REVIEW_TOOL_SCHEMA = exports.ReviewResultSchema = exports.ObservationSchema = exports.FindingSchema = exports.CATEGORIES = exports.SEVERITIES = exports.ConfigSchema = exports.AutoReviewSchema = exports.PathInstructionSchema = void 0;
 const zod_1 = __nccwpck_require__(924);
 /* ------------------------------------------------------------------ *
  * Configuration schema (.aireviewer.yaml)                             *
@@ -37080,9 +37689,10 @@ exports.ConfigSchema = zod_1.z.object({
     verification: zod_1.z.boolean().default(true),
 });
 /* ------------------------------------------------------------------ *
- * Structured review output (returned by Claude via tool use)          *
+ * Structured review output (returned by the model via tool use)       *
  * ------------------------------------------------------------------ */
-exports.SEVERITIES = ["potential_issue", "refactor", "nitpick"];
+/** Rendered verbatim in the summary table and as the inline-comment label. */
+exports.SEVERITIES = ["CRITICAL", "WARNING", "SUGGESTION"];
 exports.CATEGORIES = [
     "bug",
     "security",
@@ -37098,39 +37708,33 @@ exports.FindingSchema = zod_1.z.object({
     end_line: zod_1.z.number().int().positive().optional(),
     severity: zod_1.z.enum(exports.SEVERITIES),
     category: zod_1.z.enum(exports.CATEGORIES),
+    /** Short label — renders straight after `**WARNING:**` on the inline comment. */
     title: zod_1.z.string(),
+    /** One-line problem + consequence — renders as the `Issue` cell in the summary table. */
+    summary: zod_1.z.string(),
+    /** The full explanation: symbols involved, failure path, consequence. */
     body: zod_1.z.string(),
     suggestion: zod_1.z.string().optional(),
 });
-exports.ChangedFileSchema = zod_1.z.object({
+/** Something real the model noticed that isn't anchored to a changed line. */
+exports.ObservationSchema = zod_1.z.object({
     path: zod_1.z.string(),
-    summary: zod_1.z.string(),
+    line: zod_1.z.number().int().positive().optional(),
+    note: zod_1.z.string(),
 });
 exports.ReviewResultSchema = zod_1.z.object({
-    walkthrough: zod_1.z.string(),
-    changed_files: zod_1.z.array(exports.ChangedFileSchema).default([]),
+    overall_assessment: zod_1.z.string().default(""),
     findings: zod_1.z.array(exports.FindingSchema).default([]),
+    observations: zod_1.z.array(exports.ObservationSchema).default([]),
 });
-/* The JSON Schema handed to Claude as a tool. Kept in sync with the zod
+/* The JSON Schema handed to the model as a tool. Kept in sync with the zod
  * schema above by hand (small enough not to warrant a generator). */
 exports.REVIEW_TOOL_SCHEMA = {
     type: "object",
     properties: {
-        walkthrough: {
+        overall_assessment: {
             type: "string",
-            description: "A concise markdown summary of what this PR does and why, as the author would explain it.",
-        },
-        changed_files: {
-            type: "array",
-            description: "One short entry per meaningfully-changed file.",
-            items: {
-                type: "object",
-                properties: {
-                    path: { type: "string" },
-                    summary: { type: "string" },
-                },
-                required: ["path", "summary"],
-            },
+            description: "2-5 sentences judging the change as a whole: name the patterns it introduces, say whether the design is sound, and end by characterising what the issues (if any) amount to.",
         },
         findings: {
             type: "array",
@@ -37149,21 +37753,52 @@ exports.REVIEW_TOOL_SCHEMA = {
                     },
                     severity: { type: "string", enum: [...exports.SEVERITIES] },
                     category: { type: "string", enum: [...exports.CATEGORIES] },
-                    title: { type: "string", description: "Short one-line summary." },
+                    title: {
+                        type: "string",
+                        description: "Short noun-phrase label, at most ~8 words, e.g. 'Missing `on SessionExpiredException` handler'. Not a sentence.",
+                    },
+                    summary: {
+                        type: "string",
+                        description: "One line naming the problem AND its consequence, e.g. 'Redundant `notifyListeners()` in catch + finally causes double rebuild on every error in `updateRecord`'. Rendered in a markdown table cell, so keep it to one line.",
+                    },
                     body: {
                         type: "string",
-                        description: "Explanation of the problem and why it matters.",
+                        description: "The full explanation. Name the concrete symbols involved, trace the actual failure path step by step, and state the consequence. Contrast with sibling code when the issue is an inconsistency.",
                     },
                     suggestion: {
                         type: "string",
-                        description: "Optional. Replacement code for lines [line..end_line]. Provide ONLY the replacement lines, no fences. Used to render a committable suggestion.",
+                        description: "Optional. Replacement code for lines [line..end_line]. Provide ONLY the replacement lines, no fences. Used to render a committable suggestion. Omit unless the fix is mechanical and you are confident it compiles.",
                     },
                 },
-                required: ["path", "line", "severity", "category", "title", "body"],
+                required: [
+                    "path",
+                    "line",
+                    "severity",
+                    "category",
+                    "title",
+                    "summary",
+                    "body",
+                ],
+            },
+        },
+        observations: {
+            type: "array",
+            description: "Real things you noticed in surrounding or unchanged code that are NOT anchored to a changed line. Never repeat a finding here.",
+            items: {
+                type: "object",
+                properties: {
+                    path: { type: "string" },
+                    line: { type: "integer" },
+                    note: {
+                        type: "string",
+                        description: "What you noticed and why it matters. One paragraph; rendered in a table cell.",
+                    },
+                },
+                required: ["path", "note"],
             },
         },
     },
-    required: ["walkthrough", "findings"],
+    required: ["overall_assessment", "findings"],
 };
 
 

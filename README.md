@@ -1,8 +1,9 @@
-# 🐰 AI Reviewer
+# AI Reviewer
 
 A CodeRabbit-style AI code reviewer packaged as a GitHub Action, powered by **z.ai GLM 5.2** (via its
 Anthropic-compatible endpoint). It reviews every pull request and **re-reviews incrementally on each
-new commit**, posting a walkthrough summary plus inline, one-click committable suggestions.
+new commit**, keeping a single summary comment up to date and posting inline, one-click committable
+suggestions.
 
 > **Model backend:** Uses the `@anthropic-ai/sdk` pointed at `https://api.z.ai/api/anthropic`, so
 > GLM models work with no code changes. Swap `model:` (e.g. `glm-4.6`) and `base_url:` to use any
@@ -11,17 +12,60 @@ new commit**, posting a walkthrough summary plus inline, one-click committable s
 ## Features
 
 - **Automatic reviews** on PR open and on every push (incremental — only the new changes).
-- **Walkthrough** comment (summary + changed-files table), updated in place.
-- **Inline findings** with severity (⛔ potential issue / ⚠️ refactor / 🔹 nitpick) and category.
-- **Committable suggestions** — `\`\`\`suggestion` blocks you apply with one click.
+- **One sticky summary comment**, rewritten in place on every commit and always describing the
+  **whole PR**: severity counts, issue tables, out-of-diff observations, the reviewed-files roster,
+  an overall assessment, and running token spend.
+- **Inline findings** in the form `**WARNING:** <title>` followed by an explanation that names the
+  symbols involved and traces the actual failure path.
+- **Severity**: `CRITICAL` / `WARNING` / `SUGGESTION`.
+- **Committable suggestions** — ` ```suggestion ` blocks you apply with one click.
 - **Verification pass** to cut false positives.
 - **`@bot` commands**: `review`, `full review`, `summary`, `resolve`, `pause`, `resume`, `help`.
 - **`.aireviewer.yaml`** config: profiles, path filters, path instructions, auto-review rules.
+
+## What it posts
+
+The sticky comment:
+
+```markdown
+## Code Review Summary
+
+**Status:** 2 Issues Found | **Recommendation:** Address before merge
+
+### Overview
+| Severity | Count |
+|----------|-------|
+| CRITICAL | 0 |
+| WARNING | 2 |
+| SUGGESTION | 0 |
+
+<details><summary><b>Issue Details (click to expand)</b></summary> … per-severity tables …
+<details><summary><b>Other Observations (not in diff)</b></summary> … </details>
+<details><summary><b>Files Reviewed (41 files)</b></summary> … `path` - N issues … </details>
+
+**Overall Assessment:** …
+
+<sub>Reviewed by glm-5.2 · 833,431 tokens</sub>
+```
+
+Run `npm run preview` to print a full rendered example without touching the API or GitHub.
+
+Inline comments:
+
+```markdown
+**WARNING:** Missing `on SessionExpiredException` handler
+
+`confirmReview` catches `on AppFailure` and `catch (e, st)` but does not handle
+`on SessionExpiredException` explicitly — unlike `fetchSalesData`, `updateRecord`, and
+`deleteRecord` in this same provider. …
+```
 
 ## Quick start
 
 1. Add a `ZAI_API_KEY` secret to the repo (or org) — get one at https://z.ai.
 2. Copy `examples/ai-review.yml` to `.github/workflows/ai-review.yml`.
+   Make sure the `uses:` line carries a ref — `uses: <owner>/ai-reviewer@v1`, not
+   `uses: <owner>/ai-reviewer`, which GitHub cannot resolve.
 3. (Optional) Copy `examples/.aireviewer.yaml` to the repo root.
 4. Open a PR — the review appears within a minute.
 
@@ -33,13 +77,16 @@ full usage guide.
 ```bash
 npm install
 npm run typecheck     # tsc --noEmit
+npm test              # node --test over the pure renderers, state, and merge logic
+npm run preview       # print a rendered summary comment for a fixture
 npm run build         # bundle to dist/index.js with @vercel/ncc
 ```
 
-Commit the `dist/` folder — GitHub Actions runs the bundled output. Then tag a release:
+Commit the `dist/` folder in the same commit as any `src/` change — GitHub Actions runs the bundled
+output, so a stale bundle silently runs old code. Then move the release tag:
 
 ```bash
-git tag -a v1 -m "v1" && git push origin v1
+git tag -f v1 && git push -f origin v1
 ```
 
 ## How it works
@@ -49,15 +96,33 @@ event → router → orchestrator:
   1. load .aireviewer.yaml (from PR head, via API — no checkout needed)
   2. resolve scope: full (opened) vs incremental (synchronize → lastReviewedSha...head)
   3. fetch diff, parse hunks → commentable line set (prevents 422s)
-  4. select files (path filters, max_files cap)
-  5. Claude review (tool-use structured output) → findings
+  4. select files (path filters, max_files cap), recording why each was dropped
+  5. model review (tool-use structured output) → findings + observations + assessment
   6. verification pass (drop false positives)
-  7. post review: walkthrough (upsert) + inline comments w/ suggestions (deduped)
-  8. persist lastReviewedSha in a hidden marker inside the walkthrough comment
+  7. post inline comments (deduped by a hidden per-finding id)
+  8. merge into the running totals, then upsert the sticky summary comment
 ```
 
-State lives in a hidden `<!-- AI-REVIEWER-STATE {...} -->` marker on the PR, which is how a stateless
-Action remembers what it already reviewed.
+### Staying accurate across commits
+
+The summary is cumulative, so it needs to know which findings are still open:
+
+- Every inline comment carries a hidden `<!-- air-id:… -->` derived from *path + title* — not the
+  line — so a finding that drifts down the file is still recognised as the same finding rather than
+  posted twice.
+- On each run the action reads back its own review comments. GitHub reports a comment as **outdated**
+  once the code it was anchored to changes, and that is the signal used to drop a finding from the
+  totals: fix the code, and the count goes down on the next push.
+- Surviving findings have their line refreshed from GitHub, so the table tracks the file as it moves.
+- Observations have no comment to track, so they're re-evaluated whenever their file is reviewed
+  again — file-level granularity is the honest limit there.
+- `@bot full review` resets the totals and rebuilds from scratch.
+
+State lives in a hidden, gzipped+base64 `<!-- AI-REVIEW-STATE v2 … -->` marker on the sticky comment,
+which is how a stateless Action remembers what it already reviewed. It's encoded rather than raw JSON
+because findings quote real code, and a title containing `-->` would otherwise close the HTML comment
+early and corrupt the page. v1 markers are migrated automatically, so PRs opened under an older build
+keep their position instead of being re-reviewed from scratch.
 
 ## Architecture
 
@@ -66,10 +131,13 @@ Action remembers what it already reviewed.
 | `src/main.ts` | Entry + event router (pull_request / issue_comment) |
 | `src/config.ts` | Load & validate `.aireviewer.yaml` |
 | `src/github/diff.ts` | Fetch & parse diffs; compute commentable lines |
-| `src/github/state.ts` | Read/write the hidden state marker |
-| `src/github/review.ts` | Build & post inline comments + suggestions; dedup |
+| `src/github/state.ts` | Read/write the hidden state marker; upsert the sticky comment |
+| `src/github/review.ts` | Build & post inline comments + suggestions; dedup via `air-id` |
 | `src/review/scope.ts` | Full vs incremental range resolution |
-| `src/review/engine.ts` | Claude calls (review + verify) via tool use |
+| `src/review/chunker.ts` | File selection, with a drop reason per file |
+| `src/review/engine.ts` | Model calls (review + verify) via tool use; token accounting |
+| `src/review/accumulate.ts` | Merge/expire findings and observations across commits (pure) |
+| `src/review/render.ts` | Summary-comment markdown (pure, unit-tested) |
 | `src/review/orchestrator.ts` | The 8-step flow |
 | `src/commands/handler.ts` | `@bot` command parsing & handling |
 

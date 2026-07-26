@@ -3,7 +3,8 @@ import { Octokit, Repo } from "../github/client";
 import { Config } from "../types";
 import { ReviewEngine } from "../review/engine";
 import { runReview } from "../review/orchestrator";
-import { readState, writeWalkthrough } from "../github/state";
+import { readState, writeSummary } from "../github/state";
+import { renderSummaryComment } from "../review/render";
 import { postIssueComment } from "../github/review";
 
 export type Command =
@@ -57,8 +58,9 @@ export async function handleCommand(
       break;
 
     case "summary":
+      // Redraws the sticky comment from stored state — no model call, no tokens.
       await runReview(octokit, repo, pull_number, config, engine, {
-        forceFull: true,
+        forceFull: false,
         summaryOnly: true,
       });
       break;
@@ -77,7 +79,19 @@ export async function handleCommand(
     case "resume": {
       const state = await readState(octokit, repo, pull_number);
       state.paused = command === "pause";
-      await writeWalkthrough(octokit, repo, pull_number, null, state);
+      await writeSummary(octokit, repo, pull_number, state, (budget) =>
+        renderSummaryComment(
+          {
+            findings: state.findings,
+            observations: state.observations,
+            files: state.files,
+            assessment: state.assessment,
+            model: state.model || engine.model,
+            tokens: state.tokens,
+          },
+          budget,
+        ).body,
+      );
       await postIssueComment(
         octokit,
         repo,
@@ -134,13 +148,13 @@ async function resolveThreads(
 
 function helpText(): string {
   return [
-    "### 🐰 AI Reviewer — commands",
+    "### AI Reviewer — commands",
     "",
     "| Command | Action |",
     "| --- | --- |",
     "| `@bot review` | Incremental review of what changed since last review |",
-    "| `@bot full review` | Re-review the whole PR from scratch |",
-    "| `@bot summary` | Regenerate the walkthrough summary |",
+    "| `@bot full review` | Re-review the whole PR from scratch (resets the running totals) |",
+    "| `@bot summary` | Redraw the summary comment from stored state (no model call) |",
     "| `@bot resolve` | Resolve all AI review threads |",
     "| `@bot pause` / `@bot resume` | Stop / restart automatic reviews |",
     "| `@bot help` | Show this list |",

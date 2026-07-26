@@ -7,6 +7,8 @@
   "scripts": {
     "build": "ncc build src/main.ts -o dist --source-map --license licenses.txt",
     "typecheck": "tsc --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test \"lib/**/*.test.js\"",
+    "preview": "tsc -p tsconfig.test.json && node lib/review/preview.js",
     "package": "npm run build"
   },
   "keywords": ["github-action", "code-review", "ai", "claude", "anthropic"],

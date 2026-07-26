@@ -29,10 +29,11 @@ export type Config = z.infer<typeof ConfigSchema>;
 export type PathInstruction = z.infer<typeof PathInstructionSchema>;
 
 /* ------------------------------------------------------------------ *
- * Structured review output (returned by Claude via tool use)          *
+ * Structured review output (returned by the model via tool use)       *
  * ------------------------------------------------------------------ */
 
-export const SEVERITIES = ["potential_issue", "refactor", "nitpick"] as const;
+/** Rendered verbatim in the summary table and as the inline-comment label. */
+export const SEVERITIES = ["CRITICAL", "WARNING", "SUGGESTION"] as const;
 export const CATEGORIES = [
   "bug",
   "security",
@@ -43,53 +44,85 @@ export const CATEGORIES = [
   "other",
 ] as const;
 
+export type Severity = (typeof SEVERITIES)[number];
+
 export const FindingSchema = z.object({
   path: z.string(),
   line: z.number().int().positive(),
   end_line: z.number().int().positive().optional(),
   severity: z.enum(SEVERITIES),
   category: z.enum(CATEGORIES),
+  /** Short label — renders straight after `**WARNING:**` on the inline comment. */
   title: z.string(),
+  /** One-line problem + consequence — renders as the `Issue` cell in the summary table. */
+  summary: z.string(),
+  /** The full explanation: symbols involved, failure path, consequence. */
   body: z.string(),
   suggestion: z.string().optional(),
 });
 
-export const ChangedFileSchema = z.object({
+/** Something real the model noticed that isn't anchored to a changed line. */
+export const ObservationSchema = z.object({
   path: z.string(),
-  summary: z.string(),
+  line: z.number().int().positive().optional(),
+  note: z.string(),
 });
 
 export const ReviewResultSchema = z.object({
-  walkthrough: z.string(),
-  changed_files: z.array(ChangedFileSchema).default([]),
+  overall_assessment: z.string().default(""),
   findings: z.array(FindingSchema).default([]),
+  observations: z.array(ObservationSchema).default([]),
 });
 
 export type Finding = z.infer<typeof FindingSchema>;
-export type ChangedFile = z.infer<typeof ChangedFileSchema>;
+export type Observation = z.infer<typeof ObservationSchema>;
 export type ReviewResult = z.infer<typeof ReviewResultSchema>;
 
-/* The JSON Schema handed to Claude as a tool. Kept in sync with the zod
+/* ------------------------------------------------------------------ *
+ * Accumulated per-PR state (persisted in the hidden summary marker)   *
+ * ------------------------------------------------------------------ */
+
+/** Why a changed file is (or isn't) annotated with an issue count in the roster. */
+export type FileKind =
+  | "code" // reviewed
+  | "asset"
+  | "generated"
+  | "filtered" // excluded by the user's path_filters
+  | "cap" // over max_files
+  | "binary"
+  | "deleted";
+
+/** Keys are short because this is serialised into a comment body with a 65,536-char cap. */
+export interface StoredFinding {
+  id: string; // findingId() — stable across line drift
+  p: string; // path
+  l: number; // line, refreshed from GitHub on every run
+  s: Severity;
+  t: string; // `summary`, truncated
+  c?: number; // id of the review comment carrying it
+}
+
+export interface StoredObservation {
+  p: string;
+  l?: number;
+  n: string; // note, truncated
+}
+
+export interface StoredFile {
+  p: string;
+  k: FileKind;
+  n?: number; // issue count, `code` files only
+}
+
+/* The JSON Schema handed to the model as a tool. Kept in sync with the zod
  * schema above by hand (small enough not to warrant a generator). */
 export const REVIEW_TOOL_SCHEMA = {
   type: "object" as const,
   properties: {
-    walkthrough: {
+    overall_assessment: {
       type: "string",
       description:
-        "A concise markdown summary of what this PR does and why, as the author would explain it.",
-    },
-    changed_files: {
-      type: "array",
-      description: "One short entry per meaningfully-changed file.",
-      items: {
-        type: "object",
-        properties: {
-          path: { type: "string" },
-          summary: { type: "string" },
-        },
-        required: ["path", "summary"],
-      },
+        "2-5 sentences judging the change as a whole: name the patterns it introduces, say whether the design is sound, and end by characterising what the issues (if any) amount to.",
     },
     findings: {
       type: "array",
@@ -110,20 +143,56 @@ export const REVIEW_TOOL_SCHEMA = {
           },
           severity: { type: "string", enum: [...SEVERITIES] },
           category: { type: "string", enum: [...CATEGORIES] },
-          title: { type: "string", description: "Short one-line summary." },
+          title: {
+            type: "string",
+            description:
+              "Short noun-phrase label, at most ~8 words, e.g. 'Missing `on SessionExpiredException` handler'. Not a sentence.",
+          },
+          summary: {
+            type: "string",
+            description:
+              "One line naming the problem AND its consequence, e.g. 'Redundant `notifyListeners()` in catch + finally causes double rebuild on every error in `updateRecord`'. Rendered in a markdown table cell, so keep it to one line.",
+          },
           body: {
             type: "string",
-            description: "Explanation of the problem and why it matters.",
+            description:
+              "The full explanation. Name the concrete symbols involved, trace the actual failure path step by step, and state the consequence. Contrast with sibling code when the issue is an inconsistency.",
           },
           suggestion: {
             type: "string",
             description:
-              "Optional. Replacement code for lines [line..end_line]. Provide ONLY the replacement lines, no fences. Used to render a committable suggestion.",
+              "Optional. Replacement code for lines [line..end_line]. Provide ONLY the replacement lines, no fences. Used to render a committable suggestion. Omit unless the fix is mechanical and you are confident it compiles.",
           },
         },
-        required: ["path", "line", "severity", "category", "title", "body"],
+        required: [
+          "path",
+          "line",
+          "severity",
+          "category",
+          "title",
+          "summary",
+          "body",
+        ],
+      },
+    },
+    observations: {
+      type: "array",
+      description:
+        "Real things you noticed in surrounding or unchanged code that are NOT anchored to a changed line. Never repeat a finding here.",
+      items: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          line: { type: "integer" },
+          note: {
+            type: "string",
+            description:
+              "What you noticed and why it matters. One paragraph; rendered in a table cell.",
+          },
+        },
+        required: ["path", "note"],
       },
     },
   },
-  required: ["walkthrough", "findings"],
+  required: ["overall_assessment", "findings"],
 };
