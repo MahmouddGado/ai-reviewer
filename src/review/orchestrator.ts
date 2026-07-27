@@ -1,10 +1,18 @@
 import * as core from "@actions/core";
 import { Octokit, Repo } from "../github/client";
-import { Config, FileKind, ReviewResult, StoredFile } from "../types";
-import { parseDiffFiles } from "../github/diff";
+import {
+  Config,
+  FileKind,
+  ReviewResult,
+  StoredFile,
+  StoredFinding,
+} from "../types";
+import { DiffFile, parseDiffFiles } from "../github/diff";
 import { ReviewState, readState, writeSummary } from "../github/state";
 import {
   buildInlineComments,
+  ExistingComments,
+  findingId,
   postReview,
   readExistingComments,
 } from "../github/review";
@@ -16,6 +24,7 @@ import { ReviewEngine } from "./engine";
 import {
   buildSystemPrompt,
   buildUserPrompt,
+  PriorFindingContext,
   verificationPrompt,
 } from "./prompts";
 import {
@@ -59,7 +68,7 @@ export async function runReview(
 
   // A full review rebuilds the totals from scratch; that's the escape hatch if
   // accumulation ever drifts.
-  const base: ReviewState = opts.forceFull
+  let base: ReviewState = opts.forceFull
     ? { ...prev, findings: [], observations: [], files: [] }
     : prev;
 
@@ -72,6 +81,26 @@ export async function runReview(
 
   const allFiles = parseDiffFiles(scope.diffText);
   const { files, dropped, skippedByCap } = selectFiles(allFiles, config);
+  const renamedPaths = new Map(
+    allFiles
+      .filter((file) => !file.isDeleted && file.oldPath !== file.path)
+      .map((file) => [file.oldPath, file.path]),
+  );
+  if (renamedPaths.size > 0) {
+    base = withRenamedPaths(base, renamedPaths);
+    core.info(`Updated stored state for ${renamedPaths.size} renamed file(s).`);
+  }
+  const deletedPaths = new Set(
+    dropped.filter((d) => d.reason === "deleted").map((d) => d.path),
+  );
+  if (deletedPaths.size > 0) {
+    const removed = base.findings.filter((f) => deletedPaths.has(f.p)).length;
+    base = withoutPaths(base, deletedPaths);
+    core.info(
+      `Removed ${removed} finding(s) for ${deletedPaths.size} deleted file(s).`,
+    );
+  }
+
   if (files.length === 0) {
     core.info("All changed files were filtered out. Nothing to review.");
     const roster = buildRoster(
@@ -96,6 +125,10 @@ export async function runReview(
     incremental: scope.kind === "incremental",
   };
 
+  // Load prior comments before model calls so incremental prompts can reconcile
+  // existing findings and outdated comments can be refreshed on this commit.
+  const existing = await readExistingComments(octokit, repo, pull_number);
+
   // Every selected file is reviewed. When they don't all fit in one request we
   // send several — splitting the work, never dropping any of it.
   const batches = planBatches(files, config.batch_chars);
@@ -106,6 +139,7 @@ export async function runReview(
   );
 
   const partials: ReviewResult[] = [];
+  const suppliedPriorFindings: PriorFindingContext[] = [];
   let tokens = 0;
   let failed = 0;
 
@@ -114,7 +148,11 @@ export async function runReview(
       batches.length > 1
         ? `Batch ${i + 1}/${batches.length} (${batch.length} file(s))`
         : `${batch.length} file(s)`;
-    const user = buildUserPrompt(meta, batch, config);
+    const priorFindings = meta.incremental
+      ? priorFindingsForBatch(batch, base.findings, existing)
+      : [];
+    const priorIds = new Set(priorFindings.map((finding) => finding.id));
+    const user = buildUserPrompt(meta, batch, config, priorFindings);
 
     let partial: ReviewResult;
     try {
@@ -128,8 +166,15 @@ export async function runReview(
       continue;
     }
 
-    if (config.verification && partial.findings.length > 0) {
-      core.info(`${label}: verifying ${partial.findings.length} finding(s)…`);
+    if (
+      config.verification &&
+      (partial.findings.length > 0 ||
+        partial.prior_finding_verdicts.length > 0 ||
+        priorFindings.length > 0)
+    ) {
+      core.info(
+        `${label}: verifying ${partial.findings.length} finding(s) and ${priorFindings.length} prior finding(s)…`,
+      );
       try {
         const verified = await engine.verify(
           verificationPrompt(),
@@ -147,6 +192,10 @@ export async function runReview(
           observations: verified.result.observations.length
             ? verified.result.observations
             : partial.observations,
+          prior_finding_verdicts:
+            verified.result.prior_finding_verdicts.length > 0
+              ? verified.result.prior_finding_verdicts
+              : partial.prior_finding_verdicts,
         };
       } catch (err: any) {
         core.warning(
@@ -154,6 +203,13 @@ export async function runReview(
         );
       }
     }
+    partial = {
+      ...partial,
+      prior_finding_verdicts: partial.prior_finding_verdicts.filter((verdict) =>
+        priorIds.has(verdict.id),
+      ),
+    };
+    suppliedPriorFindings.push(...priorFindings);
     partials.push(partial);
   }
 
@@ -169,15 +225,22 @@ export async function runReview(
   }
 
   const result: ReviewResult = mergeResults(partials);
-
-  // Always read existing comments, including on full runs — GitHub does not
-  // dedupe, so skipping this re-posts every comment on `@bot full review`.
-  const existing = await readExistingComments(octokit, repo, pull_number);
+  const suppliedPriorIds = new Set(
+    suppliedPriorFindings.map((finding) => finding.id),
+  );
+  const priorVerdicts = result.prior_finding_verdicts.filter((verdict) =>
+    suppliedPriorIds.has(verdict.id),
+  );
+  const findingAliases = priorFindingAliases(
+    result.findings,
+    suppliedPriorFindings,
+  );
 
   const { comments, unanchored, duplicates } = buildInlineComments(
     result.findings,
     files,
     existing,
+    findingAliases,
   );
 
   await postReview(
@@ -193,13 +256,17 @@ export async function runReview(
 
   const reviewedPaths = new Set(files.map((f) => f.path));
   const freshFindings = result.findings
-    .filter((f) => !unanchored.includes(f))
-    .map(toStoredFinding);
+    .filter((finding) => !unanchored.includes(finding))
+    .map((finding) => {
+      const stored = toStoredFinding(finding);
+      return { ...stored, id: findingAliases.get(stored.id) ?? stored.id };
+    });
 
   const { findings, expired } = mergeFindings(
     base.findings,
     freshFindings,
     existing.byId,
+    priorVerdicts,
   );
 
   const freshObservations = [
@@ -235,7 +302,7 @@ export async function runReview(
 
   core.info(
     `Done. ${comments.length} new comment(s), ${duplicates.length} duplicate(s) skipped, ` +
-      `${unanchored.length} demoted to observations, ${expired.length} expired. ` +
+      `${unanchored.length} demoted to observations, ${expired.length} resolved. ` +
       `Totals: ${findings.length} finding(s) across ${roster.length} file(s)` +
       (skippedByCap > 0 ? `; ${skippedByCap} file(s) over max_files` : "") +
       ".",
@@ -258,7 +325,92 @@ function mergeResults(partials: ReviewResult[]): ReviewResult {
     overall_assessment: assessments.join(" "),
     findings: partials.flatMap((p) => p.findings),
     observations: partials.flatMap((p) => p.observations),
+    prior_finding_verdicts: partials.flatMap(
+      (p) => p.prior_finding_verdicts,
+    ),
   };
+}
+
+export function priorFindingsForBatch(
+  batch: DiffFile[],
+  findings: StoredFinding[],
+  existing: ExistingComments,
+): PriorFindingContext[] {
+  const currentPath = new Map<string, string>();
+  for (const file of batch) {
+    currentPath.set(file.path, file.path);
+    currentPath.set(file.oldPath, file.path);
+  }
+
+  return findings.flatMap((finding) => {
+    const path = currentPath.get(finding.p);
+    if (!path) return [];
+    const status = existing.byId.get(finding.id);
+    return [
+      {
+        id: finding.id,
+        path,
+        line: status && !status.outdated ? status.line : finding.l,
+        severity: finding.s,
+        title: status?.title ?? finding.h ?? finding.t,
+        summary: finding.t,
+      },
+    ];
+  });
+}
+
+export function withoutPaths(
+  state: ReviewState,
+  paths: Set<string>,
+): ReviewState {
+  if (paths.size === 0) return state;
+  return {
+    ...state,
+    findings: state.findings.filter((finding) => !paths.has(finding.p)),
+    observations: state.observations.filter((note) => !paths.has(note.p)),
+    files: state.files.filter((file) => !paths.has(file.p)),
+  };
+}
+
+export function withRenamedPaths(
+  state: ReviewState,
+  renamedPaths: Map<string, string>,
+): ReviewState {
+  if (renamedPaths.size === 0) return state;
+  const currentPath = (path: string) => renamedPaths.get(path) ?? path;
+  return {
+    ...state,
+    findings: state.findings.map((finding) => ({
+      ...finding,
+      p: currentPath(finding.p),
+    })),
+    observations: state.observations.map((note) => ({
+      ...note,
+      p: currentPath(note.p),
+    })),
+    files: state.files.map((file) => ({ ...file, p: currentPath(file.p) })),
+  };
+}
+
+export function priorFindingAliases(
+  findings: ReviewResult["findings"],
+  priorFindings: PriorFindingContext[],
+): Map<string, string> {
+  const priorIdByNaturalId = new Map<string, string | null>();
+  for (const prior of priorFindings) {
+    const naturalId = findingId(prior.path, prior.title);
+    const current = priorIdByNaturalId.get(naturalId);
+    if (current === undefined) priorIdByNaturalId.set(naturalId, prior.id);
+    else if (current !== prior.id) priorIdByNaturalId.set(naturalId, null);
+  }
+
+  const aliases = new Map<string, string>();
+  for (const finding of findings) {
+    const naturalId = findingId(finding.path, finding.title);
+    const priorId = priorIdByNaturalId.get(naturalId);
+    if (priorId) aliases.set(naturalId, priorId);
+  }
+  return aliases;
 }
 
 /** Bump the counters that advance regardless of what the review found. */

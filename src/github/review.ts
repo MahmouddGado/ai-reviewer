@@ -19,6 +19,8 @@ export interface TrackedComment {
   line: number;
   /** GitHub nulls `position` once the anchored code changes — i.e. the author touched it. */
   outdated: boolean;
+  /** Used to recover finding titles from state written before titles were persisted. */
+  title?: string;
 }
 
 export interface ExistingComments {
@@ -54,12 +56,15 @@ export function legacySignature(
 }
 
 /** Render a finding into a review-comment body, with a committable suggestion when present. */
-export function renderFindingBody(f: Finding): string {
+export function renderFindingBody(
+  f: Finding,
+  id = findingId(f.path, f.title),
+): string {
   let body = `**${f.severity}:** ${f.title}\n\n${f.body}`;
   if (f.suggestion && f.suggestion.trim().length > 0) {
     body += `\n\n\`\`\`suggestion\n${f.suggestion.replace(/\n+$/, "")}\n\`\`\``;
   }
-  return `${body}\n\n<!-- air-id:${findingId(f.path, f.title)} -->`;
+  return `${body}\n\n<!-- air-id:${id} -->`;
 }
 
 /** Pull the air-id back out of a comment body we (or an earlier run) wrote. */
@@ -99,6 +104,7 @@ export function buildInlineComments(
   findings: Finding[],
   diffFiles: DiffFile[],
   existing: ExistingComments,
+  idAliases: Map<string, string> = new Map(),
 ): {
   comments: InlineComment[];
   unanchored: Finding[];
@@ -111,11 +117,13 @@ export function buildInlineComments(
   const seen = new Set<string>();
 
   for (const f of findings) {
-    const id = findingId(f.path, f.title);
+    const naturalId = findingId(f.path, f.title);
+    const id = idAliases.get(naturalId) ?? naturalId;
+    const tracked = existing.byId.get(id);
 
     if (
       seen.has(id) ||
-      existing.byId.has(id) ||
+      (tracked !== undefined && !tracked.outdated) ||
       existing.legacy.has(legacySignature(f.path, f.line, f.title))
     ) {
       duplicates.push(f);
@@ -131,7 +139,7 @@ export function buildInlineComments(
     seen.add(id);
     const comment: InlineComment = {
       path: f.path,
-      body: renderFindingBody(f),
+      body: renderFindingBody(f, id),
       line: f.line,
       side: "RIGHT",
     };
@@ -150,8 +158,9 @@ export function buildInlineComments(
 
 /**
  * Read back every review comment we've posted on this PR. This is both the dedup
- * source and — via `outdated` — the signal that the author has changed the code a
- * finding was anchored to, which is how findings drop off the summary once fixed.
+ * source and the line/status snapshot used by incremental reconciliation.
+ * `outdated` means the anchor changed, not that the underlying issue was fixed;
+ * only the model's explicit reconciliation verdict can establish that.
  */
 export async function readExistingComments(
   octokit: Octokit,
@@ -173,11 +182,18 @@ export async function readExistingComments(
 
       const id = extractAirId(body);
       if (id) {
-        byId.set(id, {
+        const tracked = {
           commentId: c.id,
           line,
           outdated: c.position === null || c.position === undefined,
-        });
+          title: extractLegacyTitle(body)?.slice(0, 160),
+        };
+        const previous = byId.get(id);
+        // Duplicate ids can exist after an outdated comment is refreshed. A
+        // live comment must win regardless of API ordering.
+        if (!previous || previous.outdated || !tracked.outdated) {
+          byId.set(id, tracked);
+        }
         continue;
       }
       const title = extractLegacyTitle(body);

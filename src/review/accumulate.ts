@@ -1,6 +1,7 @@
 import {
   Finding,
   Observation,
+  PriorFindingVerdict,
   SEVERITIES,
   StoredFinding,
   StoredObservation,
@@ -24,8 +25,14 @@ export interface CommentStatus {
 
 /** Table cells only ever show one line; the full prose lives in the inline comment. */
 const TEXT_CAP = 300;
+const TITLE_CAP = 160;
 const MAX_FINDINGS = 200;
 const MAX_OBSERVATIONS = 50;
+const VERDICT_RANK = {
+  resolved: 0,
+  unknown: 1,
+  unresolved: 2,
+} as const;
 
 export function toStoredFinding(f: Finding): StoredFinding {
   return {
@@ -33,6 +40,7 @@ export function toStoredFinding(f: Finding): StoredFinding {
     p: f.path,
     l: f.line,
     s: f.severity,
+    h: clamp(f.title, TITLE_CAP),
     t: clamp(f.summary || f.title, TEXT_CAP),
   };
 }
@@ -53,32 +61,59 @@ export function findingToObservation(f: Finding): StoredObservation {
 /**
  * Carry findings forward across commits.
  *
- * A stored finding is dropped when GitHub reports its comment as outdated —
- * that means the author edited the code it was anchored to, so it counts as
- * addressed. Surviving findings have their line refreshed from GitHub, which is
- * what keeps the summary table accurate as later commits shift lines around.
+ * GitHub's "outdated" flag only proves that an anchored line changed; it is not
+ * proof that the bug was fixed. Only an explicit `resolved` model verdict drops
+ * a previous finding. `unknown`, missing, and conflicting verdicts all keep it.
+ *
+ * Live comments refresh line numbers. Fresh findings always win, and an
+ * outdated comment is never attached to a refreshed finding.
  */
 export function mergeFindings(
   prev: StoredFinding[],
   fresh: StoredFinding[],
   tracked: Map<string, CommentStatus>,
+  verdicts: PriorFindingVerdict[] = [],
 ): { findings: StoredFinding[]; expired: StoredFinding[] } {
   const kept = new Map<string, StoredFinding>();
   const expired: StoredFinding[] = [];
+  const freshIds = new Set(fresh.map((f) => f.id));
+  const verdictById = new Map<string, PriorFindingVerdict>();
+
+  for (const verdict of verdicts) {
+    const current = verdictById.get(verdict.id);
+    if (
+      !current ||
+      VERDICT_RANK[verdict.status] > VERDICT_RANK[current.status]
+    ) {
+      verdictById.set(verdict.id, verdict);
+    }
+  }
 
   for (const f of prev) {
     const status = tracked.get(f.id);
-    if (status?.outdated) {
+    const verdict = verdictById.get(f.id);
+    if (verdict?.status === "resolved" && !freshIds.has(f.id)) {
       expired.push(f);
       continue;
     }
-    kept.set(f.id, status ? { ...f, l: status.line, c: status.commentId } : f);
+    if (freshIds.has(f.id)) continue;
+
+    if (status && !status.outdated) {
+      kept.set(f.id, { ...f, l: status.line, c: status.commentId });
+    } else {
+      kept.set(f.id, { ...f, c: undefined });
+    }
   }
 
-  // Fresh results win — and re-add anything we just expired that is still real.
+  // A live old comment still owns the finding; an outdated one must be refreshed.
   for (const f of fresh) {
     const status = tracked.get(f.id);
-    kept.set(f.id, status ? { ...f, l: status.line, c: status.commentId } : f);
+    kept.set(
+      f.id,
+      status && !status.outdated
+        ? { ...f, l: status.line, c: status.commentId }
+        : f,
+    );
   }
 
   return { findings: capFindings([...kept.values()]), expired };

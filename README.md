@@ -98,8 +98,8 @@ event → router → orchestrator:
   3. fetch diff, parse hunks → commentable line set (prevents 422s)
   4. select files (path filters, optional max_files cap), recording why each was dropped
   5. split into batches of <= batch_chars so an unlimited file count still fits a request
-  6. model review per batch (tool-use structured output) → findings + observations + assessment
-  7. verification pass per batch (drop false positives)
+  6. model review per batch → new findings + verdicts for relevant findings from earlier commits
+  7. verification pass per batch (drop false positives and re-check resolution verdicts)
   8. post inline comments (deduped by a hidden per-finding id)
   9. merge into the running totals, then upsert the sticky summary comment
 ```
@@ -111,10 +111,13 @@ The summary is cumulative, so it needs to know which findings are still open:
 - Every inline comment carries a hidden `<!-- air-id:… -->` derived from *path + title* — not the
   line — so a finding that drifts down the file is still recognised as the same finding rather than
   posted twice.
-- On each run the action reads back its own review comments. GitHub reports a comment as **outdated**
-  once the code it was anchored to changes, and that is the signal used to drop a finding from the
-  totals: fix the code, and the count goes down on the next push.
-- Surviving findings have their line refreshed from GitHub, so the table tracks the file as it moves.
+- On each new commit, findings from earlier reviews are supplied to the model alongside the
+  incremental diff for their changed files. Each receives a `resolved`, `unresolved`, or `unknown`
+  verdict. Only an explicit `resolved` verdict removes it from the totals; missing context keeps it.
+- GitHub's **outdated** flag means an anchor changed, not that the bug was fixed. If the issue remains,
+  the action can post a refreshed comment on the new commit; live comments are still deduplicated.
+- Surviving live findings have their line refreshed from GitHub, so the table tracks the file as it
+  moves. Findings and observations are removed immediately when their file is deleted.
 - Observations have no comment to track, so they're re-evaluated whenever their file is reviewed
   again — file-level granularity is the honest limit there.
 - `@bot full review` resets the totals and rebuilds from scratch.

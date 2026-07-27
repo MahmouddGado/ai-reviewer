@@ -128,6 +128,36 @@ describe("buildInlineComments", () => {
     assert.equal(out.duplicates.length, 1);
   });
 
+  it("refreshes a finding whose previous comment is outdated", () => {
+    const existing = {
+      byId: new Map<string, CommentStatus>([
+        [
+          findingId(FINDING.path, FINDING.title),
+          { commentId: 1, line: 346, outdated: true },
+        ],
+      ]),
+      legacy: new Set<string>(),
+    };
+    const out = buildInlineComments([FINDING], files, existing);
+
+    assert.equal(out.comments.length, 1);
+    assert.equal(out.duplicates.length, 0);
+  });
+
+  it("uses a prior id when refreshing a finding after a rename", () => {
+    const priorId = findingId("src/old-name.ts", FINDING.title);
+    const renamed = { ...FINDING, path: "src/new-name.ts" };
+    const out = buildInlineComments(
+      [renamed],
+      [diffFile(renamed.path, [renamed.line])],
+      NO_EXISTING,
+      new Map([[findingId(renamed.path, renamed.title), priorId]]),
+    );
+
+    assert.equal(out.comments.length, 1);
+    assert.equal(extractAirId(out.comments[0].body), priorId);
+  });
+
   it("does not post the same finding twice within one run", () => {
     const out = buildInlineComments([FINDING, FINDING], files, NO_EXISTING);
     assert.equal(out.comments.length, 1);
@@ -141,15 +171,47 @@ describe("mergeFindings", () => {
   it("carries findings forward across commits", () => {
     const { findings } = mergeFindings([stored], [], new Map());
     assert.equal(findings.length, 1);
+    assert.equal(findings[0].h, FINDING.title);
   });
 
-  it("expires a finding once GitHub marks its comment outdated", () => {
+  it("keeps an outdated finding without a resolved verdict", () => {
     const tracked = new Map<string, CommentStatus>([
       [stored.id, { commentId: 7, line: 346, outdated: true }],
     ]);
     const { findings, expired } = mergeFindings([stored], [], tracked);
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].c, undefined);
+    assert.equal(expired.length, 0);
+  });
+
+  it("removes a finding only after an explicit resolved verdict", () => {
+    const tracked = new Map<string, CommentStatus>([
+      [stored.id, { commentId: 7, line: 346, outdated: false }],
+    ]);
+    const { findings, expired } = mergeFindings(
+      [stored],
+      [],
+      tracked,
+      [
+        { id: stored.id, status: "resolved", reason: "The guard was added." },
+      ],
+    );
     assert.equal(findings.length, 0);
     assert.equal(expired.length, 1);
+  });
+
+  it("keeps a finding when reconciliation verdicts conflict", () => {
+    const { findings, expired } = mergeFindings(
+      [stored],
+      [],
+      new Map(),
+      [
+        { id: stored.id, status: "resolved", reason: "Looks fixed." },
+        { id: stored.id, status: "unknown", reason: "Context is incomplete." },
+      ],
+    );
+    assert.equal(findings.length, 1);
+    assert.equal(expired.length, 0);
   });
 
   it("refreshes the line number as later commits shift the code", () => {
@@ -163,9 +225,17 @@ describe("mergeFindings", () => {
 
   it("does not duplicate a finding the model re-reports on a later run", () => {
     const drifted = toStoredFinding({ ...FINDING, line: 372 });
-    const { findings } = mergeFindings([stored], [drifted], new Map());
+    const { findings, expired } = mergeFindings(
+      [stored],
+      [drifted],
+      new Map(),
+      [
+        { id: stored.id, status: "resolved", reason: "Incorrect draft verdict." },
+      ],
+    );
     assert.equal(findings.length, 1);
     assert.equal(findings[0].l, 372);
+    assert.equal(expired.length, 0);
   });
 
   it("never evicts a CRITICAL to make room for a SUGGESTION", () => {

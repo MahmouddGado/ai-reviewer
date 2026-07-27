@@ -76,14 +76,29 @@ export const ObservationSchema = z.object({
   note: z.string(),
 });
 
+export const PRIOR_FINDING_STATUSES = [
+  "resolved",
+  "unresolved",
+  "unknown",
+] as const;
+
+/** Internal verdict used to reconcile findings from earlier commits. */
+export const PriorFindingVerdictSchema = z.object({
+  id: z.string().min(1).max(64),
+  status: z.enum(PRIOR_FINDING_STATUSES),
+  reason: z.string().max(1000),
+});
+
 export const ReviewResultSchema = z.object({
   overall_assessment: z.string().default(""),
   findings: z.array(FindingSchema).default([]),
   observations: z.array(ObservationSchema).default([]),
+  prior_finding_verdicts: z.array(PriorFindingVerdictSchema).default([]),
 });
 
 export type Finding = z.infer<typeof FindingSchema>;
 export type Observation = z.infer<typeof ObservationSchema>;
+export type PriorFindingVerdict = z.infer<typeof PriorFindingVerdictSchema>;
 export type ReviewResult = z.infer<typeof ReviewResultSchema>;
 
 /* ------------------------------------------------------------------ *
@@ -106,6 +121,7 @@ export interface StoredFinding {
   p: string; // path
   l: number; // line, refreshed from GitHub on every run
   s: Severity;
+  h?: string; // original title; absent in state written by older builds
   t: string; // `summary`, truncated
   c?: number; // id of the review comment carrying it
 }
@@ -201,6 +217,33 @@ export const REVIEW_TOOL_SCHEMA = {
         required: ["path", "note"],
       },
     },
+    prior_finding_verdicts: {
+      type: "array",
+      description:
+        "One reconciliation verdict for every previous finding supplied in the prompt. Empty when no previous findings were supplied.",
+      items: {
+        type: "object",
+        properties: {
+          id: {
+            type: "string",
+            description:
+              "The exact opaque finding id supplied in the previous-findings section.",
+          },
+          status: {
+            type: "string",
+            enum: [...PRIOR_FINDING_STATUSES],
+            description:
+              "resolved only when the shown change proves the issue is fixed; unresolved when it clearly remains; unknown when context is insufficient.",
+          },
+          reason: {
+            type: "string",
+            description:
+              "One concise sentence citing the visible evidence for the verdict.",
+          },
+        },
+        required: ["id", "status", "reason"],
+      },
+    },
   },
-  required: ["overall_assessment", "findings"],
+  required: ["overall_assessment", "findings", "prior_finding_verdicts"],
 };

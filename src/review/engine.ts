@@ -2,6 +2,7 @@ import * as core from "@actions/core";
 import Anthropic from "@anthropic-ai/sdk";
 import {
   FindingSchema,
+  PriorFindingVerdictSchema,
   REVIEW_TOOL_SCHEMA,
   ReviewResult,
   ReviewResultSchema,
@@ -72,7 +73,8 @@ export class ReviewEngine {
           {
             type: "tool_result",
             tool_use_id: "draft",
-            content: "Now verify and resubmit only the findings that survive.",
+            content:
+              "Now verify the findings and prior-finding verdicts, then resubmit the complete result.",
           },
         ],
       },
@@ -91,7 +93,7 @@ export class ReviewEngine {
         {
           name: TOOL_NAME,
           description:
-            "Submit the structured code review (overall assessment, line-anchored findings, and out-of-diff observations).",
+            "Submit the structured code review, including prior-finding reconciliation when prior findings were supplied.",
           input_schema: REVIEW_TOOL_SCHEMA as any,
         },
       ],
@@ -139,9 +141,17 @@ function salvage(input: unknown): ReviewResult {
         return one.success ? [one.data] : [];
       })
     : [];
+  const priorVerdicts = Array.isArray(raw.prior_finding_verdicts)
+    ? raw.prior_finding_verdicts.flatMap((v) => {
+        const one = PriorFindingVerdictSchema.safeParse(v);
+        return one.success ? [one.data] : [];
+      })
+    : [];
 
-  if (findings.length > 0) {
-    core.warning(`Salvaged ${findings.length} finding(s) from a partial response.`);
+  if (findings.length > 0 || priorVerdicts.length > 0) {
+    core.warning(
+      `Salvaged ${findings.length} finding(s) and ${priorVerdicts.length} prior verdict(s) from a partial response.`,
+    );
   }
 
   return ReviewResultSchema.parse({
@@ -149,6 +159,7 @@ function salvage(input: unknown): ReviewResult {
       typeof raw.overall_assessment === "string" ? raw.overall_assessment : "",
     findings,
     observations: [],
+    prior_finding_verdicts: priorVerdicts,
   });
 }
 
