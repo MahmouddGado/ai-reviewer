@@ -1,10 +1,13 @@
 import {
   FileKind,
+  ReviewScopeKind,
+  ReviewSnapshot,
   SEVERITIES,
   Severity,
   StoredFile,
   StoredFinding,
   StoredObservation,
+  TokenUsage,
 } from "../types";
 
 /**
@@ -18,16 +21,25 @@ export interface SummaryInput {
   files: StoredFile[];
   assessment: string;
   model: string;
-  tokens: number;
+  usage: TokenUsage;
+  commit: string | null;
+  scope: ReviewScopeKind;
+  history: ReviewSnapshot[];
 }
 
 export type SeverityCounts = Record<Severity, number>;
 
 /** How aggressively the body was shrunk to fit GitHub's comment size cap. */
-export type Degradation = "none" | "roster" | "observations" | "findings";
+export type Degradation =
+  | "none"
+  | "history"
+  | "roster"
+  | "observations"
+  | "findings";
 
 const DEGRADATIONS: Degradation[] = [
   "none",
+  "history",
   "roster",
   "observations",
   "findings",
@@ -38,6 +50,7 @@ const KIND_LABEL: Record<Exclude<FileKind, "code">, string> = {
   generated: "generated file",
   filtered: "excluded by path_filters",
   cap: "not reviewed (max_files)",
+  failed: "review failed (will retry)",
   binary: "binary file",
   deleted: "deleted",
 };
@@ -51,7 +64,7 @@ export function countBySeverity(findings: StoredFinding[]): SeverityCounts {
 export function renderStatusLine(counts: SeverityCounts): string {
   const total = counts.CRITICAL + counts.WARNING + counts.SUGGESTION;
   if (total === 0) {
-    return "**Status:** No Issues Found | **Recommendation:** Approve";
+    return "**Status:** No Issues Found | **Recommendation:** Merge";
   }
   const recommendation =
     counts.CRITICAL > 0
@@ -106,13 +119,30 @@ export function renderObservations(observations: StoredObservation[]): string {
   );
 }
 
-export function renderFileRoster(files: StoredFile[]): string {
-  if (files.length === 0) return "";
+export function renderFileRoster(
+  files: StoredFile[],
+  context?: {
+    commit: string | null;
+    scope: ReviewScopeKind;
+    total?: number;
+  },
+): string {
+  const total = Math.max(files.length, context?.total ?? 0);
+  if (total === 0) return "";
   const sorted = [...files].sort((a, b) => a.p.localeCompare(b.p));
-  const noun = files.length === 1 ? "file" : "files";
+  const noun = total === 1 ? "file" : "files";
+  const pass =
+    context?.scope === "incremental" && context.commit
+      ? ` — incremental pass on ${context.commit.slice(0, 7)}`
+      : "";
   return details(
-    `Files Reviewed (${files.length} ${noun})`,
-    sorted.map((f) => `- \`${f.p}\` - ${fileLabel(f)}`).join("\n"),
+    `Files Reviewed (${total} ${noun}${pass})`,
+    [
+      ...sorted.map((f) => `- \`${f.p}\` - ${fileLabel(f)}`),
+      ...(total > files.length
+        ? [`\n_…and ${total - files.length} more file(s)._`]
+        : []),
+    ].join("\n"),
   );
 }
 
@@ -143,6 +173,7 @@ export function buildRoster(
   changedPaths: string[],
   droppedKinds: Map<string, FileKind>,
   issueCounts: Map<string, number>,
+  reviewNotes: Map<string, string> = new Map(),
 ): StoredFile[] {
   const roster: StoredFile[] = [];
   for (const p of new Set(changedPaths)) {
@@ -154,25 +185,19 @@ export function buildRoster(
     const n = issueCounts.get(p) ?? 0;
     const inferred = inferKind(p);
     roster.push(
-      n === 0 && inferred !== "code" ? { p, k: inferred } : { p, k: "code", n },
+      n === 0 && inferred !== "code"
+        ? { p, k: inferred }
+        : {
+            p,
+            k: "code",
+            n,
+            ...(n === 0 && reviewNotes.get(p)
+              ? { r: rosterNote(reviewNotes.get(p)!) }
+              : {}),
+          },
     );
   }
   return roster;
-}
-
-/**
- * Union the roster across runs: this run's classification wins for files it
- * touched, earlier runs supply the files it didn't. Counts are NOT merged here —
- * they're recomputed from the accumulated findings by `applyIssueCounts`, since
- * summing per-run counts would double-count a finding re-reported on a later push.
- */
-export function mergeRoster(
-  prev: StoredFile[],
-  next: StoredFile[],
-): StoredFile[] {
-  const byPath = new Map(prev.map((f) => [f.p, f]));
-  for (const f of next) byPath.set(f.p, f);
-  return [...byPath.values()];
 }
 
 /** Recompute every `code` entry's issue count from the current finding set. */
@@ -193,6 +218,7 @@ export function applyIssueCounts(
 export function fileLabel(f: StoredFile): string {
   if (f.k !== "code") return KIND_LABEL[f.k];
   const n = f.n ?? 0;
+  if (n === 0) return f.r || "clean";
   return `${n} ${n === 1 ? "issue" : "issues"}`;
 }
 
@@ -224,9 +250,10 @@ function build(
     "## Code Review Summary",
     "",
     renderStatusLine(counts),
-    "",
-    renderOverviewTable(counts),
   ];
+  if (input.findings.length > 0) {
+    parts.push("", renderOverviewTable(counts));
+  }
 
   let findings = input.findings;
   if (degradation === "findings" && findings.length > FINDINGS_CAP) {
@@ -251,29 +278,102 @@ function build(
   const obs = renderObservations(observations);
   if (obs) parts.push("", obs);
 
-  if (degradation === "none") {
-    const roster = renderFileRoster(input.files);
+  if (degradation === "none" || degradation === "history") {
+    const roster = renderFileRoster(input.files, {
+      commit: input.commit,
+      scope: input.scope,
+    });
     if (roster) parts.push("", roster);
   } else if (input.files.length > 0) {
     const noun = input.files.length === 1 ? "file" : "files";
     parts.push("", `_Reviewed ${input.files.length} ${noun}._`);
   }
 
-  if (input.assessment.trim()) {
+  if (input.scope === "full" && input.assessment.trim()) {
     parts.push("", "---", "", `**Overall Assessment:** ${input.assessment.trim()}`);
   }
 
-  const credit = input.tokens > 0
-    ? `Reviewed by ${input.model} · ${formatCount(input.tokens)} tokens`
-    : `Reviewed by ${input.model}`;
+  if (degradation === "none") {
+    const history = renderHistory(input.history);
+    if (history) parts.push("", history);
+  } else if (input.history.length > 0) {
+    dropped += input.history.length;
+  }
+
+  const credit = renderUsage(input.model, input.usage);
   parts.push(
     "",
     "---",
-    "<sub>`@bot review` · `@bot full review` · `@bot resolve` · `@bot help`</sub>",
+    "<!-- kilo-usage -->",
     `<sub>${credit}</sub>`,
   );
 
   return { body: parts.join("\n"), degradation, dropped };
+}
+
+export function renderHistory(history: ReviewSnapshot[]): string {
+  if (history.length === 0) return "";
+  const latest = history[0].sha.slice(0, 7);
+  const noun = history.length === 1 ? "snapshot" : "snapshots";
+  const lines = [
+    "<!-- kilo-review-history -->",
+    "<details>",
+    `<summary><b>Previous Review Summaries</b> (${history.length} ${noun}, latest commit ${latest})</summary>`,
+    "",
+    "_Current summary above is authoritative. Previous snapshots are kept for context only._",
+  ];
+
+  for (const snapshot of history) {
+    const counts = snapshot.counts ?? countBySeverity(snapshot.findings);
+    const findingCount = Object.values(counts).reduce(
+      (sum, count) => sum + count,
+      0,
+    );
+    lines.push(
+      "<!-- kilo-review-history-entry -->",
+      `### Previous review (commit ${snapshot.sha.slice(0, 7)})`,
+      "",
+      renderStatusLine(counts),
+    );
+    if (snapshot.findings.length > 0) {
+      lines.push(
+        "",
+        renderOverviewTable(counts),
+        "",
+        renderIssueDetails(snapshot.findings),
+      );
+      if (findingCount > snapshot.findings.length) {
+        lines.push(
+          "",
+          `_…and ${findingCount - snapshot.findings.length} more issue(s)._`,
+        );
+      }
+    }
+    const observations = renderObservations(snapshot.observations);
+    if (observations) lines.push("", observations);
+    const roster = renderFileRoster(snapshot.files, {
+      commit: snapshot.sha,
+      scope: snapshot.scope,
+      total: snapshot.fileCount,
+    });
+    if (roster) lines.push("", roster);
+    lines.push("");
+  }
+
+  lines.push("</details>", "<!-- /kilo-review-history -->");
+  return lines.join("\n");
+}
+
+export function renderUsage(model: string, usage: TokenUsage): string {
+  if (usage.input + usage.output + usage.cached === 0) {
+    return `Reviewed by ${model}`;
+  }
+  return [
+    `Reviewed by ${model}`,
+    `Input: ${formatCompactCount(usage.input)}`,
+    `Output: ${formatCompactCount(usage.output)}`,
+    `Cached: ${formatCompactCount(usage.cached)}`,
+  ].join(" · ");
 }
 
 /** Locale-independent thousands separators, so snapshots don't depend on ICU. */
@@ -282,6 +382,16 @@ export function formatCount(n: number): string {
     /\B(?=(\d{3})+(?!\d))/g,
     ",",
   );
+}
+
+/** Compact usage counts such as 29K, 7.3K, and 1.2M. */
+export function formatCompactCount(n: number): string {
+  const value = Math.max(0, n);
+  if (value < 1000) return formatCount(value);
+  const unit = value >= 1_000_000 ? "M" : "K";
+  const divisor = unit === "M" ? 1_000_000 : 1000;
+  const compact = Math.round((value / divisor) * 10) / 10;
+  return `${compact}${unit}`;
 }
 
 const FINDINGS_CAP = 50;
@@ -293,5 +403,16 @@ function details(summary: string, body: string): string {
 
 /** Markdown table cells can't contain pipes or newlines. */
 function cell(text: string): string {
-  return text.replace(/\s*\n\s*/g, " ").replace(/\|/g, "\\|").trim();
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\s*\n\s*/g, " ")
+    .replace(/\|/g, "\\|")
+    .trim();
+}
+
+function rosterNote(text: string): string {
+  const flat = cell(text);
+  return flat.length <= 500 ? flat : `${flat.slice(0, 499).trimEnd()}…`;
 }

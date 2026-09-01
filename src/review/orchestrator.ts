@@ -6,9 +6,15 @@ import {
   ReviewResult,
   StoredFile,
   StoredFinding,
+  TokenUsage,
 } from "../types";
 import { DiffFile, parseDiffFiles } from "../github/diff";
-import { ReviewState, readState, writeSummary } from "../github/state";
+import {
+  historyWithPrevious,
+  ReviewState,
+  readState,
+  writeSummary,
+} from "../github/state";
 import {
   buildInlineComments,
   ExistingComments,
@@ -30,7 +36,6 @@ import {
 import {
   applyIssueCounts,
   buildRoster,
-  mergeRoster,
   renderSummaryComment,
 } from "./render";
 import {
@@ -75,7 +80,13 @@ export async function runReview(
   const scope = await resolveScope(octokit, repo, pr, prev, opts.forceFull);
   if (!scope.hasChanges) {
     core.info("No reviewable changes in scope. Nothing to do.");
-    await publishSummary(octokit, repo, pr, advance(base, pr, 0, false), engine.model);
+    await publishSummary(
+      octokit,
+      repo,
+      pr,
+      advance(base, pr, EMPTY_USAGE, false, scope.kind),
+      engine.model,
+    );
     return;
   }
 
@@ -108,8 +119,10 @@ export async function runReview(
       new Map(dropped.map((d) => [d.path, d.reason as FileKind])),
       new Map(),
     );
-    const next = advance(base, pr, 0, false);
-    next.files = mergeRoster(base.files, roster);
+    const next = advance(base, pr, EMPTY_USAGE, false, scope.kind);
+    next.summarySha = pr.headSha;
+    next.scope = scope.kind;
+    next.files = roster;
     await publishSummary(octokit, repo, pr, next, engine.model);
     return;
   }
@@ -140,7 +153,9 @@ export async function runReview(
 
   const partials: ReviewResult[] = [];
   const suppliedPriorFindings: PriorFindingContext[] = [];
-  let tokens = 0;
+  const reviewedFiles: DiffFile[] = [];
+  const failedPaths = new Set<string>();
+  let usage: TokenUsage = { ...EMPTY_USAGE };
   let failed = 0;
 
   for (const [i, batch] of batches.entries()) {
@@ -157,11 +172,12 @@ export async function runReview(
     let partial: ReviewResult;
     try {
       const draft = await engine.review(system, user);
-      tokens += draft.usage.total;
+      usage = addUsage(usage, draft.usage);
       partial = draft.result;
     } catch (err: any) {
       // One failed batch must not throw away the batches that succeeded.
       failed++;
+      for (const file of batch) failedPaths.add(file.path);
       core.warning(`${label} failed to review (${err.message}); skipping it.`);
       continue;
     }
@@ -181,7 +197,7 @@ export async function runReview(
           user,
           partial,
         );
-        tokens += verified.usage.total;
+        usage = addUsage(usage, verified.usage);
         // The verify pass returns a whole fresh result, so anything the model
         // forgot to echo back would otherwise be silently lost.
         partial = {
@@ -192,6 +208,9 @@ export async function runReview(
           observations: verified.result.observations.length
             ? verified.result.observations
             : partial.observations,
+          file_reviews: verified.result.file_reviews.length
+            ? verified.result.file_reviews
+            : partial.file_reviews,
           prior_finding_verdicts:
             verified.result.prior_finding_verdicts.length > 0
               ? verified.result.prior_finding_verdicts
@@ -205,10 +224,12 @@ export async function runReview(
     }
     partial = {
       ...partial,
+      file_reviews: fileReviewsForBatch(partial.file_reviews, batch),
       prior_finding_verdicts: partial.prior_finding_verdicts.filter((verdict) =>
         priorIds.has(verdict.id),
       ),
     };
+    reviewedFiles.push(...batch);
     suppliedPriorFindings.push(...priorFindings);
     partials.push(partial);
   }
@@ -238,7 +259,7 @@ export async function runReview(
 
   const { comments, unanchored, duplicates } = buildInlineComments(
     result.findings,
-    files,
+    reviewedFiles,
     existing,
     findingAliases,
   );
@@ -248,13 +269,13 @@ export async function runReview(
     repo,
     pull_number,
     pr.headSha,
-    reviewBody(files.length, pr.headSha, comments.length),
+    reviewBody(reviewedFiles.length, pr.headSha, comments.length),
     comments,
   );
 
   /* ---- fold this run into the running totals ---- */
 
-  const reviewedPaths = new Set(files.map((f) => f.path));
+  const reviewedPaths = new Set(reviewedFiles.map((f) => f.path));
   const freshFindings = result.findings
     .filter((finding) => !unanchored.includes(finding))
     .map((finding) => {
@@ -279,23 +300,46 @@ export async function runReview(
   );
 
   const issueCounts = new Map<string, number>();
-  for (const f of findings) issueCounts.set(f.p, (issueCounts.get(f.p) ?? 0) + 1);
+  for (const f of findings) {
+    if (reviewedPaths.has(f.p)) {
+      issueCounts.set(f.p, (issueCounts.get(f.p) ?? 0) + 1);
+    }
+  }
+  const reviewNotes = buildFileReviewNotes(
+    result.file_reviews,
+    priorVerdicts,
+    suppliedPriorFindings,
+    issueCounts,
+  );
+  const droppedKinds = new Map<string, FileKind>(
+    dropped.map((item) => [item.path, item.reason as FileKind]),
+  );
+  for (const path of failedPaths) droppedKinds.set(path, "failed");
   const roster: StoredFile[] = applyIssueCounts(
-    mergeRoster(
-      base.files,
-      buildRoster(
-        allFiles.map((f) => f.path),
-        new Map(dropped.map((d) => [d.path, d.reason as FileKind])),
-        issueCounts,
-      ),
+    buildRoster(
+      allFiles.map((f) => f.path),
+      droppedKinds,
+      issueCounts,
+      reviewNotes,
     ),
-    findings,
+    findings.filter((finding) => reviewedPaths.has(finding.p)),
   );
 
-  const next = advance(base, pr, tokens, true);
+  const next = advance(
+    base,
+    pr,
+    usage,
+    true,
+    scope.kind,
+    failed === 0,
+  );
   next.findings = findings;
   next.observations = observations;
   next.files = roster;
+  next.summarySha = pr.headSha;
+  if ((prev.summarySha ?? prev.lastReviewedSha) !== pr.headSha) {
+    next.history = historyWithPrevious(prev);
+  }
   next.assessment = result.overall_assessment.trim() || base.assessment;
 
   await publishSummary(octokit, repo, pr, next, engine.model);
@@ -303,8 +347,9 @@ export async function runReview(
   core.info(
     `Done. ${comments.length} new comment(s), ${duplicates.length} duplicate(s) skipped, ` +
       `${unanchored.length} demoted to observations, ${expired.length} resolved. ` +
-      `Totals: ${findings.length} finding(s) across ${roster.length} file(s)` +
+      `Totals: ${findings.length} open finding(s); this pass covered ${reviewedFiles.length} file(s)` +
       (skippedByCap > 0 ? `; ${skippedByCap} file(s) over max_files` : "") +
+      (failed > 0 ? `; ${failedPaths.size} file(s) queued for retry` : "") +
       ".",
   );
 }
@@ -325,10 +370,77 @@ function mergeResults(partials: ReviewResult[]): ReviewResult {
     overall_assessment: assessments.join(" "),
     findings: partials.flatMap((p) => p.findings),
     observations: partials.flatMap((p) => p.observations),
+    file_reviews: partials.flatMap((p) => p.file_reviews),
     prior_finding_verdicts: partials.flatMap(
       (p) => p.prior_finding_verdicts,
     ),
   };
+}
+
+function fileReviewsForBatch(
+  reviews: ReviewResult["file_reviews"],
+  batch: DiffFile[],
+): ReviewResult["file_reviews"] {
+  const allowed = new Set(batch.map((file) => file.path));
+  const byPath = new Map<string, ReviewResult["file_reviews"][number]>();
+  for (const review of reviews) {
+    if (
+      allowed.has(review.path) &&
+      review.summary.trim() &&
+      !byPath.has(review.path)
+    ) {
+      byPath.set(review.path, review);
+    }
+  }
+  return batch.flatMap((file) => {
+    const review = byPath.get(file.path);
+    return review ? [review] : [];
+  });
+}
+
+export function buildFileReviewNotes(
+  reviews: ReviewResult["file_reviews"],
+  verdicts: ReviewResult["prior_finding_verdicts"],
+  priorFindings: PriorFindingContext[],
+  issueCounts: Map<string, number>,
+): Map<string, string> {
+  const notes = new Map<string, string>();
+  for (const review of reviews) {
+    if (!notes.has(review.path)) {
+      notes.set(review.path, flatten(review.summary));
+    }
+  }
+
+  const priorById = new Map(
+    priorFindings.map((finding) => [finding.id, finding]),
+  );
+  for (const verdict of verdicts) {
+    const prior = priorById.get(verdict.id);
+    if (!prior || verdict.status === "unknown") continue;
+    const note = notes.get(prior.path) ?? "";
+    const alreadyMentionsOutcome =
+      verdict.status === "resolved"
+        ? /\b(fix(?:ed)?|resolv(?:e|ed))\b/i.test(note)
+        : /\b(open|remain(?:s|ed)?|unresolved)\b/i.test(note);
+    if (alreadyMentionsOutcome) continue;
+
+    const outcome =
+      verdict.status === "resolved"
+        ? `previous \`${prior.title}\` finding verified fixed (${flatten(verdict.reason)})`
+        : `previous \`${prior.title}\` finding remains open (${flatten(verdict.reason)})`;
+    notes.set(prior.path, note ? `${note}; ${outcome}` : outcome);
+  }
+
+  for (const [path, note] of notes) {
+    if ((issueCounts.get(path) ?? 0) === 0 && !/^clean\b/i.test(note)) {
+      notes.set(path, `clean; ${note}`);
+    }
+  }
+  return notes;
+}
+
+function flatten(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 export function priorFindingsForBatch(
@@ -414,17 +526,21 @@ export function priorFindingAliases(
 }
 
 /** Bump the counters that advance regardless of what the review found. */
-function advance(
+export function advance(
   base: ReviewState,
   pr: PrDetails,
-  tokens: number,
+  usage: TokenUsage,
   counted: boolean,
+  scope: ReviewState["scope"],
+  advanceCheckpoint = true,
 ): ReviewState {
   return {
     ...base,
-    lastReviewedSha: pr.headSha,
+    lastReviewedSha: advanceCheckpoint ? pr.headSha : base.lastReviewedSha,
+    summarySha: counted ? pr.headSha : base.summarySha,
+    scope: counted ? scope : base.scope,
     reviewCount: base.reviewCount + (counted ? 1 : 0),
-    tokens: base.tokens + tokens,
+    usage: addUsage(base.usage, usage),
   };
 }
 
@@ -448,7 +564,10 @@ async function publishSummary(
         files: next.files,
         assessment: next.assessment,
         model,
-        tokens: next.tokens,
+        usage: next.usage,
+        commit: next.summarySha,
+        scope: next.scope,
+        history: next.history,
       },
       budget,
     );
@@ -461,6 +580,19 @@ async function publishSummary(
     }
     return body;
   });
+}
+
+const EMPTY_USAGE: TokenUsage = { input: 0, output: 0, cached: 0 };
+
+function addUsage<T extends TokenUsage>(
+  left: TokenUsage,
+  right: T,
+): TokenUsage {
+  return {
+    input: left.input + right.input,
+    output: left.output + right.output,
+    cached: left.cached + right.cached,
+  };
 }
 
 /**

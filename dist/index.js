@@ -35751,7 +35751,10 @@ async function handleCommand(command, octokit, repo, pull_number, config, engine
                 files: state.files,
                 assessment: state.assessment,
                 model: state.model || engine.model,
-                tokens: state.tokens,
+                usage: state.usage,
+                commit: state.summarySha,
+                scope: state.scope,
+                history: state.history,
             }, budget).body);
             await (0, review_1.postIssueComment)(octokit, repo, pull_number, command === "pause"
                 ? "⏸️ Automatic reviews paused. Comment `@bot resume` to re-enable."
@@ -36342,37 +36345,44 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.DEFAULT_STATE = exports.SUMMARY_MARKER = exports.COMMENT_LIMIT = exports.STATE_VERSION = void 0;
+exports.DEFAULT_STATE = exports.SUMMARY_MARKER = exports.COMMENT_LIMIT = exports.HISTORY_LIMIT = exports.STATE_VERSION = void 0;
 exports.encodeState = encodeState;
 exports.parseState = parseState;
+exports.historyWithPrevious = historyWithPrevious;
 exports.findSummaryComment = findSummaryComment;
 exports.readState = readState;
 exports.writeSummary = writeSummary;
 const core = __importStar(__nccwpck_require__(7484));
 const zlib_1 = __nccwpck_require__(3106);
-exports.STATE_VERSION = 2;
+const types_1 = __nccwpck_require__(8522);
+exports.STATE_VERSION = 3;
+exports.HISTORY_LIMIT = 3;
 /** GitHub's hard cap on an issue-comment body. */
 exports.COMMENT_LIMIT = 65536;
 /** Headroom for the markers, separators, and any server-side normalisation. */
 const SLACK = 2048;
 exports.SUMMARY_MARKER = "<!-- kilo-review -->";
-const STATE_RE = /<!--\s*AI-REVIEW-STATE\s+v2\s+([A-Za-z0-9+/=]+)\s*-->/;
+const STATE_RE = /<!--\s*AI-REVIEW-STATE\s+v3\s+([A-Za-z0-9+/=]+)\s*-->/;
+const V2_STATE_RE = /<!--\s*AI-REVIEW-STATE\s+v2\s+([A-Za-z0-9+/=]+)\s*-->/;
 /* Markers written by earlier builds. We still *match* them so an open PR keeps
  * updating its original comment instead of sprouting a second one, but we only
- * ever *write* SUMMARY_MARKER + the v2 state marker. */
+ * ever *write* SUMMARY_MARKER + the latest state marker. */
 const LEGACY_WALKTHROUGH_MARKER = "<!-- AI-REVIEWER-WALKTHROUGH -->";
 const LEGACY_STATE_RE = /<!--\s*AI-REVIEWER-STATE\s+(\{.*?\})\s*-->/s;
 exports.DEFAULT_STATE = {
     v: exports.STATE_VERSION,
     lastReviewedSha: null,
+    summarySha: null,
     reviewCount: 0,
     paused: false,
-    tokens: 0,
+    usage: { input: 0, output: 0, cached: 0 },
     model: "",
     assessment: "",
+    scope: "full",
     findings: [],
     observations: [],
     files: [],
+    history: [],
 };
 /**
  * The payload is gzipped and base64'd rather than embedded as raw JSON. Findings
@@ -36382,19 +36392,31 @@ exports.DEFAULT_STATE = {
  */
 function encodeState(state) {
     const packed = (0, zlib_1.gzipSync)(Buffer.from(JSON.stringify(state), "utf8")).toString("base64");
-    return `<!-- AI-REVIEW-STATE v2 ${packed} -->`;
+    return `<!-- AI-REVIEW-STATE v3 ${packed} -->`;
 }
 function parseState(body) {
     if (!body)
         return null;
-    const v2 = body.match(STATE_RE);
-    if (v2) {
+    const current = body.match(STATE_RE);
+    if (current) {
         try {
-            const json = (0, zlib_1.gunzipSync)(Buffer.from(v2[1], "base64")).toString("utf8");
-            return { ...exports.DEFAULT_STATE, ...JSON.parse(json) };
+            const json = (0, zlib_1.gunzipSync)(Buffer.from(current[1], "base64")).toString("utf8");
+            return migrateState(JSON.parse(json));
         }
         catch (err) {
             core.warning(`Could not decode review state: ${err.message}`);
+            return null;
+        }
+    }
+    const v2 = body.match(V2_STATE_RE);
+    if (v2) {
+        try {
+            const json = (0, zlib_1.gunzipSync)(Buffer.from(v2[1], "base64")).toString("utf8");
+            core.info("Migrating v2 review state to v3.");
+            return migrateState(JSON.parse(json));
+        }
+        catch (err) {
+            core.warning(`Could not decode v2 review state: ${err.message}`);
             return null;
         }
     }
@@ -36404,14 +36426,74 @@ function parseState(body) {
     if (v1) {
         try {
             const legacy = JSON.parse(v1[1]);
-            core.info("Migrating v1 review state to v2.");
-            return { ...exports.DEFAULT_STATE, ...legacy, v: exports.STATE_VERSION };
+            core.info("Migrating v1 review state to v3.");
+            return migrateState(legacy);
         }
         catch {
             return null;
         }
     }
     return null;
+}
+/** Add the currently-visible summary to the bounded history for the next pass. */
+function historyWithPrevious(state) {
+    const sha = state.summarySha ?? state.lastReviewedSha;
+    if (!sha || state.reviewCount === 0)
+        return state.history;
+    const snapshot = {
+        sha,
+        scope: state.scope,
+        counts: {
+            CRITICAL: state.findings.filter((finding) => finding.s === "CRITICAL")
+                .length,
+            WARNING: state.findings.filter((finding) => finding.s === "WARNING")
+                .length,
+            SUGGESTION: state.findings.filter((finding) => finding.s === "SUGGESTION")
+                .length,
+        },
+        findings: [...state.findings]
+            .sort((left, right) => types_1.SEVERITIES.indexOf(left.s) - types_1.SEVERITIES.indexOf(right.s))
+            .slice(0, 50),
+        observations: state.observations.slice(0, 20),
+        fileCount: state.files.length,
+        files: state.files.slice(0, 150),
+    };
+    return [snapshot, ...state.history.filter((item) => item.sha !== sha)].slice(0, exports.HISTORY_LIMIT);
+}
+function migrateState(raw) {
+    const legacyTokens = finite(raw?.tokens);
+    const usage = raw?.usage
+        ? {
+            input: finite(raw.usage.input),
+            output: finite(raw.usage.output),
+            cached: finite(raw.usage.cached),
+        }
+        : { input: legacyTokens, output: 0, cached: 0 };
+    return {
+        ...exports.DEFAULT_STATE,
+        v: exports.STATE_VERSION,
+        lastReviewedSha: typeof raw?.lastReviewedSha === "string" ? raw.lastReviewedSha : null,
+        summarySha: typeof raw?.summarySha === "string"
+            ? raw.summarySha
+            : typeof raw?.lastReviewedSha === "string"
+                ? raw.lastReviewedSha
+                : null,
+        usage,
+        reviewCount: Math.max(0, Math.trunc(finite(raw?.reviewCount))),
+        paused: raw?.paused === true,
+        model: typeof raw?.model === "string" ? raw.model : "",
+        assessment: typeof raw?.assessment === "string" ? raw.assessment : "",
+        scope: raw?.scope === "incremental" ? "incremental" : "full",
+        findings: Array.isArray(raw?.findings) ? raw.findings : [],
+        observations: Array.isArray(raw?.observations) ? raw.observations : [],
+        files: Array.isArray(raw?.files) ? raw.files : [],
+        history: Array.isArray(raw?.history)
+            ? raw.history.slice(0, exports.HISTORY_LIMIT)
+            : [],
+    };
+}
+function finite(value) {
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 /** Find the bot's sticky summary comment, across every marker we've ever written. */
 async function findSummaryComment(octokit, repo, issue_number) {
@@ -37182,6 +37264,12 @@ function salvage(input) {
             return one.success ? [one.data] : [];
         })
         : [];
+    const fileReviews = Array.isArray(raw.file_reviews)
+        ? raw.file_reviews.flatMap((review) => {
+            const one = types_1.FileReviewSchema.safeParse(review);
+            return one.success ? [one.data] : [];
+        })
+        : [];
     if (findings.length > 0 || priorVerdicts.length > 0) {
         core.warning(`Salvaged ${findings.length} finding(s) and ${priorVerdicts.length} prior verdict(s) from a partial response.`);
     }
@@ -37189,6 +37277,7 @@ function salvage(input) {
         overall_assessment: typeof raw.overall_assessment === "string" ? raw.overall_assessment : "",
         findings,
         observations: [],
+        file_reviews: fileReviews,
         prior_finding_verdicts: priorVerdicts,
     });
 }
@@ -37198,11 +37287,10 @@ function salvage(input) {
  */
 function readUsage(response) {
     const u = response.usage ?? {};
-    const input = num(u.input_tokens) +
-        num(u.cache_creation_input_tokens) +
-        num(u.cache_read_input_tokens);
+    const input = num(u.input_tokens);
     const output = num(u.output_tokens);
-    return { input, output, total: input + output };
+    const cached = num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens);
+    return { input, output, cached };
 }
 function num(v) {
     return typeof v === "number" && Number.isFinite(v) ? v : 0;
@@ -37251,10 +37339,12 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.runReview = runReview;
+exports.buildFileReviewNotes = buildFileReviewNotes;
 exports.priorFindingsForBatch = priorFindingsForBatch;
 exports.withoutPaths = withoutPaths;
 exports.withRenamedPaths = withRenamedPaths;
 exports.priorFindingAliases = priorFindingAliases;
+exports.advance = advance;
 const core = __importStar(__nccwpck_require__(7484));
 const diff_1 = __nccwpck_require__(4032);
 const state_1 = __nccwpck_require__(8862);
@@ -37284,7 +37374,7 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
     const scope = await (0, scope_1.resolveScope)(octokit, repo, pr, prev, opts.forceFull);
     if (!scope.hasChanges) {
         core.info("No reviewable changes in scope. Nothing to do.");
-        await publishSummary(octokit, repo, pr, advance(base, pr, 0, false), engine.model);
+        await publishSummary(octokit, repo, pr, advance(base, pr, EMPTY_USAGE, false, scope.kind), engine.model);
         return;
     }
     const allFiles = (0, diff_1.parseDiffFiles)(scope.diffText);
@@ -37305,8 +37395,10 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
     if (files.length === 0) {
         core.info("All changed files were filtered out. Nothing to review.");
         const roster = (0, render_1.buildRoster)(allFiles.map((f) => f.path), new Map(dropped.map((d) => [d.path, d.reason])), new Map());
-        const next = advance(base, pr, 0, false);
-        next.files = (0, render_1.mergeRoster)(base.files, roster);
+        const next = advance(base, pr, EMPTY_USAGE, false, scope.kind);
+        next.summarySha = pr.headSha;
+        next.scope = scope.kind;
+        next.files = roster;
         await publishSummary(octokit, repo, pr, next, engine.model);
         return;
     }
@@ -37331,7 +37423,9 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
         "…");
     const partials = [];
     const suppliedPriorFindings = [];
-    let tokens = 0;
+    const reviewedFiles = [];
+    const failedPaths = new Set();
+    let usage = { ...EMPTY_USAGE };
     let failed = 0;
     for (const [i, batch] of batches.entries()) {
         const label = batches.length > 1
@@ -37345,12 +37439,14 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
         let partial;
         try {
             const draft = await engine.review(system, user);
-            tokens += draft.usage.total;
+            usage = addUsage(usage, draft.usage);
             partial = draft.result;
         }
         catch (err) {
             // One failed batch must not throw away the batches that succeeded.
             failed++;
+            for (const file of batch)
+                failedPaths.add(file.path);
             core.warning(`${label} failed to review (${err.message}); skipping it.`);
             continue;
         }
@@ -37361,7 +37457,7 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
             core.info(`${label}: verifying ${partial.findings.length} finding(s) and ${priorFindings.length} prior finding(s)…`);
             try {
                 const verified = await engine.verify((0, prompts_1.verificationPrompt)(), user, partial);
-                tokens += verified.usage.total;
+                usage = addUsage(usage, verified.usage);
                 // The verify pass returns a whole fresh result, so anything the model
                 // forgot to echo back would otherwise be silently lost.
                 partial = {
@@ -37371,6 +37467,9 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
                     observations: verified.result.observations.length
                         ? verified.result.observations
                         : partial.observations,
+                    file_reviews: verified.result.file_reviews.length
+                        ? verified.result.file_reviews
+                        : partial.file_reviews,
                     prior_finding_verdicts: verified.result.prior_finding_verdicts.length > 0
                         ? verified.result.prior_finding_verdicts
                         : partial.prior_finding_verdicts,
@@ -37382,8 +37481,10 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
         }
         partial = {
             ...partial,
+            file_reviews: fileReviewsForBatch(partial.file_reviews, batch),
             prior_finding_verdicts: partial.prior_finding_verdicts.filter((verdict) => priorIds.has(verdict.id)),
         };
+        reviewedFiles.push(...batch);
         suppliedPriorFindings.push(...priorFindings);
         partials.push(partial);
     }
@@ -37397,10 +37498,10 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
     const suppliedPriorIds = new Set(suppliedPriorFindings.map((finding) => finding.id));
     const priorVerdicts = result.prior_finding_verdicts.filter((verdict) => suppliedPriorIds.has(verdict.id));
     const findingAliases = priorFindingAliases(result.findings, suppliedPriorFindings);
-    const { comments, unanchored, duplicates } = (0, review_1.buildInlineComments)(result.findings, files, existing, findingAliases);
-    await (0, review_1.postReview)(octokit, repo, pull_number, pr.headSha, reviewBody(files.length, pr.headSha, comments.length), comments);
+    const { comments, unanchored, duplicates } = (0, review_1.buildInlineComments)(result.findings, reviewedFiles, existing, findingAliases);
+    await (0, review_1.postReview)(octokit, repo, pull_number, pr.headSha, reviewBody(reviewedFiles.length, pr.headSha, comments.length), comments);
     /* ---- fold this run into the running totals ---- */
-    const reviewedPaths = new Set(files.map((f) => f.path));
+    const reviewedPaths = new Set(reviewedFiles.map((f) => f.path));
     const freshFindings = result.findings
         .filter((finding) => !unanchored.includes(finding))
         .map((finding) => {
@@ -37414,19 +37515,31 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
     ];
     const observations = (0, accumulate_1.dropObservationsWithComments)((0, accumulate_1.mergeObservations)(base.observations, freshObservations, reviewedPaths), findings);
     const issueCounts = new Map();
-    for (const f of findings)
-        issueCounts.set(f.p, (issueCounts.get(f.p) ?? 0) + 1);
-    const roster = (0, render_1.applyIssueCounts)((0, render_1.mergeRoster)(base.files, (0, render_1.buildRoster)(allFiles.map((f) => f.path), new Map(dropped.map((d) => [d.path, d.reason])), issueCounts)), findings);
-    const next = advance(base, pr, tokens, true);
+    for (const f of findings) {
+        if (reviewedPaths.has(f.p)) {
+            issueCounts.set(f.p, (issueCounts.get(f.p) ?? 0) + 1);
+        }
+    }
+    const reviewNotes = buildFileReviewNotes(result.file_reviews, priorVerdicts, suppliedPriorFindings, issueCounts);
+    const droppedKinds = new Map(dropped.map((item) => [item.path, item.reason]));
+    for (const path of failedPaths)
+        droppedKinds.set(path, "failed");
+    const roster = (0, render_1.applyIssueCounts)((0, render_1.buildRoster)(allFiles.map((f) => f.path), droppedKinds, issueCounts, reviewNotes), findings.filter((finding) => reviewedPaths.has(finding.p)));
+    const next = advance(base, pr, usage, true, scope.kind, failed === 0);
     next.findings = findings;
     next.observations = observations;
     next.files = roster;
+    next.summarySha = pr.headSha;
+    if ((prev.summarySha ?? prev.lastReviewedSha) !== pr.headSha) {
+        next.history = (0, state_1.historyWithPrevious)(prev);
+    }
     next.assessment = result.overall_assessment.trim() || base.assessment;
     await publishSummary(octokit, repo, pr, next, engine.model);
     core.info(`Done. ${comments.length} new comment(s), ${duplicates.length} duplicate(s) skipped, ` +
         `${unanchored.length} demoted to observations, ${expired.length} resolved. ` +
-        `Totals: ${findings.length} finding(s) across ${roster.length} file(s)` +
+        `Totals: ${findings.length} open finding(s); this pass covered ${reviewedFiles.length} file(s)` +
         (skippedByCap > 0 ? `; ${skippedByCap} file(s) over max_files` : "") +
+        (failed > 0 ? `; ${failedPaths.size} file(s) queued for retry` : "") +
         ".");
 }
 /**
@@ -37444,8 +37557,57 @@ function mergeResults(partials) {
         overall_assessment: assessments.join(" "),
         findings: partials.flatMap((p) => p.findings),
         observations: partials.flatMap((p) => p.observations),
+        file_reviews: partials.flatMap((p) => p.file_reviews),
         prior_finding_verdicts: partials.flatMap((p) => p.prior_finding_verdicts),
     };
+}
+function fileReviewsForBatch(reviews, batch) {
+    const allowed = new Set(batch.map((file) => file.path));
+    const byPath = new Map();
+    for (const review of reviews) {
+        if (allowed.has(review.path) &&
+            review.summary.trim() &&
+            !byPath.has(review.path)) {
+            byPath.set(review.path, review);
+        }
+    }
+    return batch.flatMap((file) => {
+        const review = byPath.get(file.path);
+        return review ? [review] : [];
+    });
+}
+function buildFileReviewNotes(reviews, verdicts, priorFindings, issueCounts) {
+    const notes = new Map();
+    for (const review of reviews) {
+        if (!notes.has(review.path)) {
+            notes.set(review.path, flatten(review.summary));
+        }
+    }
+    const priorById = new Map(priorFindings.map((finding) => [finding.id, finding]));
+    for (const verdict of verdicts) {
+        const prior = priorById.get(verdict.id);
+        if (!prior || verdict.status === "unknown")
+            continue;
+        const note = notes.get(prior.path) ?? "";
+        const alreadyMentionsOutcome = verdict.status === "resolved"
+            ? /\b(fix(?:ed)?|resolv(?:e|ed))\b/i.test(note)
+            : /\b(open|remain(?:s|ed)?|unresolved)\b/i.test(note);
+        if (alreadyMentionsOutcome)
+            continue;
+        const outcome = verdict.status === "resolved"
+            ? `previous \`${prior.title}\` finding verified fixed (${flatten(verdict.reason)})`
+            : `previous \`${prior.title}\` finding remains open (${flatten(verdict.reason)})`;
+        notes.set(prior.path, note ? `${note}; ${outcome}` : outcome);
+    }
+    for (const [path, note] of notes) {
+        if ((issueCounts.get(path) ?? 0) === 0 && !/^clean\b/i.test(note)) {
+            notes.set(path, `clean; ${note}`);
+        }
+    }
+    return notes;
+}
+function flatten(text) {
+    return text.replace(/\s+/g, " ").trim();
 }
 function priorFindingsForBatch(batch, findings, existing) {
     const currentPath = new Map();
@@ -37517,12 +37679,14 @@ function priorFindingAliases(findings, priorFindings) {
     return aliases;
 }
 /** Bump the counters that advance regardless of what the review found. */
-function advance(base, pr, tokens, counted) {
+function advance(base, pr, usage, counted, scope, advanceCheckpoint = true) {
     return {
         ...base,
-        lastReviewedSha: pr.headSha,
+        lastReviewedSha: advanceCheckpoint ? pr.headSha : base.lastReviewedSha,
+        summarySha: counted ? pr.headSha : base.summarySha,
+        scope: counted ? scope : base.scope,
         reviewCount: base.reviewCount + (counted ? 1 : 0),
-        tokens: base.tokens + tokens,
+        usage: addUsage(base.usage, usage),
     };
 }
 /**
@@ -37538,13 +37702,24 @@ async function publishSummary(octokit, repo, pr, state, model) {
             files: next.files,
             assessment: next.assessment,
             model,
-            tokens: next.tokens,
+            usage: next.usage,
+            commit: next.summarySha,
+            scope: next.scope,
+            history: next.history,
         }, budget);
         if (degradation !== "none") {
             core.warning(`Summary shrunk to fit GitHub's comment limit (level: ${degradation}${dropped ? `, ${dropped} row(s) hidden` : ""}).`);
         }
         return body;
     });
+}
+const EMPTY_USAGE = { input: 0, output: 0, cached: 0 };
+function addUsage(left, right) {
+    return {
+        input: left.input + right.input,
+        output: left.output + right.output,
+        cached: left.cached + right.cached,
+    };
 }
 /**
  * The review object exists only to carry the inline comments; the full report
@@ -37666,6 +37841,7 @@ function buildSystemPrompt(config) {
         "",
         "## Also required",
         "- `overall_assessment`: 2–5 sentences judging the change as a whole — name the patterns it introduces, say whether the design is sound, and end by characterising what the issues amount to. Do not re-enumerate the individual findings.",
+        "- `file_reviews`: return exactly one entry for every file in this batch, using its exact path. This drives the Files Reviewed roster. When a file has no surviving finding, start `summary` with `clean;` and then state concrete evidence: the behavior changed, the prior finding verified fixed, or the regression a test pins. When a previous finding remains, name it and say it remains open. Do not write generic labels such as `looks good`, `no issues`, or `reviewed`.",
         "- Do not invent issues. If the code is fine, return an empty `findings` array and say so in the assessment.",
         "",
         "Return your review by calling the `submit_review` tool. Do not write prose outside the tool call.",
@@ -37729,10 +37905,11 @@ function verificationPrompt() {
         "- Keep exactly one verdict for every previous finding id supplied in the user prompt; never invent an id.",
         "- `resolved` requires visible proof that the change removes the original root cause. If that proof is incomplete, change the verdict to `unknown`, not `resolved`.",
         "- `unresolved` requires visible proof that the same root cause remains. Otherwise use `unknown`.",
+        "- Check every `file_reviews` entry against the surviving findings and verdicts. It must use an exact path from the batch, must not call a file clean when it has a surviving finding, and must not claim a prior issue was fixed without a `resolved` verdict. Keep exactly one entry per shown file.",
         "",
         "Return the `submit_review` tool call containing ONLY findings that survive every applicable check. Drop speculative, pre-existing, unanchored, generic, stylistic, or duplicate findings. Do not add new findings and do not turn uncertainty into an observation.",
         "Keep surviving fields intact unless evidence requires lowering severity, removing an unsafe suggestion, or rewriting a thin `summary`/`body` to state the concrete trigger, symbols, failure path, and consequence.",
-        "Preserve `overall_assessment`, `observations`, and the complete `prior_finding_verdicts` set unless evidence requires a correction.",
+        "Preserve `overall_assessment`, `observations`, `file_reviews`, and the complete `prior_finding_verdicts` set unless evidence requires a correction.",
     ].join("\n");
 }
 
@@ -37753,14 +37930,17 @@ exports.renderObservations = renderObservations;
 exports.renderFileRoster = renderFileRoster;
 exports.inferKind = inferKind;
 exports.buildRoster = buildRoster;
-exports.mergeRoster = mergeRoster;
 exports.applyIssueCounts = applyIssueCounts;
 exports.fileLabel = fileLabel;
 exports.renderSummaryComment = renderSummaryComment;
+exports.renderHistory = renderHistory;
+exports.renderUsage = renderUsage;
 exports.formatCount = formatCount;
+exports.formatCompactCount = formatCompactCount;
 const types_1 = __nccwpck_require__(8522);
 const DEGRADATIONS = [
     "none",
+    "history",
     "roster",
     "observations",
     "findings",
@@ -37770,6 +37950,7 @@ const KIND_LABEL = {
     generated: "generated file",
     filtered: "excluded by path_filters",
     cap: "not reviewed (max_files)",
+    failed: "review failed (will retry)",
     binary: "binary file",
     deleted: "deleted",
 };
@@ -37782,7 +37963,7 @@ function countBySeverity(findings) {
 function renderStatusLine(counts) {
     const total = counts.CRITICAL + counts.WARNING + counts.SUGGESTION;
     if (total === 0) {
-        return "**Status:** No Issues Found | **Recommendation:** Approve";
+        return "**Status:** No Issues Found | **Recommendation:** Merge";
     }
     const recommendation = counts.CRITICAL > 0
         ? "Do not merge — critical issues"
@@ -37822,12 +38003,21 @@ function renderObservations(observations) {
         ...observations.map((o) => `| \`${o.p}\` | ${o.l ?? "—"} | ${cell(o.n)} |`),
     ].join("\n"));
 }
-function renderFileRoster(files) {
-    if (files.length === 0)
+function renderFileRoster(files, context) {
+    const total = Math.max(files.length, context?.total ?? 0);
+    if (total === 0)
         return "";
     const sorted = [...files].sort((a, b) => a.p.localeCompare(b.p));
-    const noun = files.length === 1 ? "file" : "files";
-    return details(`Files Reviewed (${files.length} ${noun})`, sorted.map((f) => `- \`${f.p}\` - ${fileLabel(f)}`).join("\n"));
+    const noun = total === 1 ? "file" : "files";
+    const pass = context?.scope === "incremental" && context.commit
+        ? ` — incremental pass on ${context.commit.slice(0, 7)}`
+        : "";
+    return details(`Files Reviewed (${total} ${noun}${pass})`, [
+        ...sorted.map((f) => `- \`${f.p}\` - ${fileLabel(f)}`),
+        ...(total > files.length
+            ? [`\n_…and ${total - files.length} more file(s)._`]
+            : []),
+    ].join("\n"));
 }
 const ASSET_RE = /\.(png|jpe?g|gif|svg|webp|ico|ttf|otf|woff2?|mp3|mp4|wav|lottie)$/i;
 const GENERATED_RE = /(\.g\.dart|\.freezed\.dart|\.pb\.go|\.generated\.[a-z]+|__generated__\/|\.min\.(js|css))$/i;
@@ -37850,7 +38040,7 @@ function inferKind(path) {
  * reaching the model is labelled with *why*; a reviewed file gets its issue
  * count, unless it's really an asset and the count would be noise.
  */
-function buildRoster(changedPaths, droppedKinds, issueCounts) {
+function buildRoster(changedPaths, droppedKinds, issueCounts, reviewNotes = new Map()) {
     const roster = [];
     for (const p of new Set(changedPaths)) {
         const dropped = droppedKinds.get(p);
@@ -37860,21 +38050,18 @@ function buildRoster(changedPaths, droppedKinds, issueCounts) {
         }
         const n = issueCounts.get(p) ?? 0;
         const inferred = inferKind(p);
-        roster.push(n === 0 && inferred !== "code" ? { p, k: inferred } : { p, k: "code", n });
+        roster.push(n === 0 && inferred !== "code"
+            ? { p, k: inferred }
+            : {
+                p,
+                k: "code",
+                n,
+                ...(n === 0 && reviewNotes.get(p)
+                    ? { r: rosterNote(reviewNotes.get(p)) }
+                    : {}),
+            });
     }
     return roster;
-}
-/**
- * Union the roster across runs: this run's classification wins for files it
- * touched, earlier runs supply the files it didn't. Counts are NOT merged here —
- * they're recomputed from the accumulated findings by `applyIssueCounts`, since
- * summing per-run counts would double-count a finding re-reported on a later push.
- */
-function mergeRoster(prev, next) {
-    const byPath = new Map(prev.map((f) => [f.p, f]));
-    for (const f of next)
-        byPath.set(f.p, f);
-    return [...byPath.values()];
 }
 /** Recompute every `code` entry's issue count from the current finding set. */
 function applyIssueCounts(roster, findings) {
@@ -37893,6 +38080,8 @@ function fileLabel(f) {
     if (f.k !== "code")
         return KIND_LABEL[f.k];
     const n = f.n ?? 0;
+    if (n === 0)
+        return f.r || "clean";
     return `${n} ${n === 1 ? "issue" : "issues"}`;
 }
 /**
@@ -37916,9 +38105,10 @@ function build(input, degradation) {
         "## Code Review Summary",
         "",
         renderStatusLine(counts),
-        "",
-        renderOverviewTable(counts),
     ];
+    if (input.findings.length > 0) {
+        parts.push("", renderOverviewTable(counts));
+    }
     let findings = input.findings;
     if (degradation === "findings" && findings.length > FINDINGS_CAP) {
         dropped = findings.length - FINDINGS_CAP;
@@ -37940,8 +38130,11 @@ function build(input, degradation) {
     const obs = renderObservations(observations);
     if (obs)
         parts.push("", obs);
-    if (degradation === "none") {
-        const roster = renderFileRoster(input.files);
+    if (degradation === "none" || degradation === "history") {
+        const roster = renderFileRoster(input.files, {
+            commit: input.commit,
+            scope: input.scope,
+        });
         if (roster)
             parts.push("", roster);
     }
@@ -37949,18 +38142,82 @@ function build(input, degradation) {
         const noun = input.files.length === 1 ? "file" : "files";
         parts.push("", `_Reviewed ${input.files.length} ${noun}._`);
     }
-    if (input.assessment.trim()) {
+    if (input.scope === "full" && input.assessment.trim()) {
         parts.push("", "---", "", `**Overall Assessment:** ${input.assessment.trim()}`);
     }
-    const credit = input.tokens > 0
-        ? `Reviewed by ${input.model} · ${formatCount(input.tokens)} tokens`
-        : `Reviewed by ${input.model}`;
-    parts.push("", "---", "<sub>`@bot review` · `@bot full review` · `@bot resolve` · `@bot help`</sub>", `<sub>${credit}</sub>`);
+    if (degradation === "none") {
+        const history = renderHistory(input.history);
+        if (history)
+            parts.push("", history);
+    }
+    else if (input.history.length > 0) {
+        dropped += input.history.length;
+    }
+    const credit = renderUsage(input.model, input.usage);
+    parts.push("", "---", "<!-- kilo-usage -->", `<sub>${credit}</sub>`);
     return { body: parts.join("\n"), degradation, dropped };
+}
+function renderHistory(history) {
+    if (history.length === 0)
+        return "";
+    const latest = history[0].sha.slice(0, 7);
+    const noun = history.length === 1 ? "snapshot" : "snapshots";
+    const lines = [
+        "<!-- kilo-review-history -->",
+        "<details>",
+        `<summary><b>Previous Review Summaries</b> (${history.length} ${noun}, latest commit ${latest})</summary>`,
+        "",
+        "_Current summary above is authoritative. Previous snapshots are kept for context only._",
+    ];
+    for (const snapshot of history) {
+        const counts = snapshot.counts ?? countBySeverity(snapshot.findings);
+        const findingCount = Object.values(counts).reduce((sum, count) => sum + count, 0);
+        lines.push("<!-- kilo-review-history-entry -->", `### Previous review (commit ${snapshot.sha.slice(0, 7)})`, "", renderStatusLine(counts));
+        if (snapshot.findings.length > 0) {
+            lines.push("", renderOverviewTable(counts), "", renderIssueDetails(snapshot.findings));
+            if (findingCount > snapshot.findings.length) {
+                lines.push("", `_…and ${findingCount - snapshot.findings.length} more issue(s)._`);
+            }
+        }
+        const observations = renderObservations(snapshot.observations);
+        if (observations)
+            lines.push("", observations);
+        const roster = renderFileRoster(snapshot.files, {
+            commit: snapshot.sha,
+            scope: snapshot.scope,
+            total: snapshot.fileCount,
+        });
+        if (roster)
+            lines.push("", roster);
+        lines.push("");
+    }
+    lines.push("</details>", "<!-- /kilo-review-history -->");
+    return lines.join("\n");
+}
+function renderUsage(model, usage) {
+    if (usage.input + usage.output + usage.cached === 0) {
+        return `Reviewed by ${model}`;
+    }
+    return [
+        `Reviewed by ${model}`,
+        `Input: ${formatCompactCount(usage.input)}`,
+        `Output: ${formatCompactCount(usage.output)}`,
+        `Cached: ${formatCompactCount(usage.cached)}`,
+    ].join(" · ");
 }
 /** Locale-independent thousands separators, so snapshots don't depend on ICU. */
 function formatCount(n) {
     return String(Math.max(0, Math.round(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+/** Compact usage counts such as 29K, 7.3K, and 1.2M. */
+function formatCompactCount(n) {
+    const value = Math.max(0, n);
+    if (value < 1000)
+        return formatCount(value);
+    const unit = value >= 1_000_000 ? "M" : "K";
+    const divisor = unit === "M" ? 1_000_000 : 1000;
+    const compact = Math.round((value / divisor) * 10) / 10;
+    return `${compact}${unit}`;
 }
 const FINDINGS_CAP = 50;
 const OBSERVATIONS_CAP = 20;
@@ -37969,7 +38226,17 @@ function details(summary, body) {
 }
 /** Markdown table cells can't contain pipes or newlines. */
 function cell(text) {
-    return text.replace(/\s*\n\s*/g, " ").replace(/\|/g, "\\|").trim();
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\s*\n\s*/g, " ")
+        .replace(/\|/g, "\\|")
+        .trim();
+}
+function rosterNote(text) {
+    const flat = cell(text);
+    return flat.length <= 500 ? flat : `${flat.slice(0, 499).trimEnd()}…`;
 }
 
 
@@ -38061,7 +38328,7 @@ async function resolveScope(octokit, repo, pr, state, forceFull) {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.REVIEW_TOOL_SCHEMA = exports.ReviewResultSchema = exports.PriorFindingVerdictSchema = exports.PRIOR_FINDING_STATUSES = exports.ObservationSchema = exports.FindingSchema = exports.CATEGORIES = exports.SEVERITIES = exports.ConfigSchema = exports.AutoReviewSchema = exports.PathInstructionSchema = void 0;
+exports.REVIEW_TOOL_SCHEMA = exports.ReviewResultSchema = exports.PriorFindingVerdictSchema = exports.PRIOR_FINDING_STATUSES = exports.FileReviewSchema = exports.ObservationSchema = exports.FindingSchema = exports.CATEGORIES = exports.SEVERITIES = exports.ConfigSchema = exports.AutoReviewSchema = exports.PathInstructionSchema = void 0;
 const zod_1 = __nccwpck_require__(924);
 /* ------------------------------------------------------------------ *
  * Configuration schema (.aireviewer.yaml)                             *
@@ -38126,6 +38393,11 @@ exports.ObservationSchema = zod_1.z.object({
     line: zod_1.z.number().int().positive().optional(),
     note: zod_1.z.string(),
 });
+/** Concise evidence-backed outcome for one file in the current review pass. */
+exports.FileReviewSchema = zod_1.z.object({
+    path: zod_1.z.string(),
+    summary: zod_1.z.string().max(1000),
+});
 exports.PRIOR_FINDING_STATUSES = [
     "resolved",
     "unresolved",
@@ -38141,6 +38413,7 @@ exports.ReviewResultSchema = zod_1.z.object({
     overall_assessment: zod_1.z.string().default(""),
     findings: zod_1.z.array(exports.FindingSchema).default([]),
     observations: zod_1.z.array(exports.ObservationSchema).default([]),
+    file_reviews: zod_1.z.array(exports.FileReviewSchema).default([]),
     prior_finding_verdicts: zod_1.z.array(exports.PriorFindingVerdictSchema).default([]),
 });
 /* The JSON Schema handed to the model as a tool. Kept in sync with the zod
@@ -38213,6 +38486,24 @@ exports.REVIEW_TOOL_SCHEMA = {
                 required: ["path", "note"],
             },
         },
+        file_reviews: {
+            type: "array",
+            description: "Exactly one concise review outcome for every file in this batch, including clean files and tests.",
+            items: {
+                type: "object",
+                properties: {
+                    path: {
+                        type: "string",
+                        description: "The exact repo-relative path shown in this batch.",
+                    },
+                    summary: {
+                        type: "string",
+                        description: "A concise evidence-backed roster label. Start with 'clean' when the file has no surviving finding; then state what changed, which prior finding was fixed or remains, or which behavior a test pins. Never write a generic phrase such as 'looks good'.",
+                    },
+                },
+                required: ["path", "summary"],
+            },
+        },
         prior_finding_verdicts: {
             type: "array",
             description: "One reconciliation verdict for every previous finding supplied in the prompt. Empty when no previous findings were supplied.",
@@ -38237,7 +38528,12 @@ exports.REVIEW_TOOL_SCHEMA = {
             },
         },
     },
-    required: ["overall_assessment", "findings", "prior_finding_verdicts"],
+    required: [
+        "overall_assessment",
+        "findings",
+        "file_reviews",
+        "prior_finding_verdicts",
+    ],
 };
 
 

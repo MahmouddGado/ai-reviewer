@@ -1,12 +1,20 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { DEFAULT_STATE, encodeState, parseState, ReviewState } from "./state";
+import { gzipSync } from "node:zlib";
+import {
+  DEFAULT_STATE,
+  encodeState,
+  historyWithPrevious,
+  parseState,
+  ReviewState,
+} from "./state";
 
 const STATE: ReviewState = {
   ...DEFAULT_STATE,
   lastReviewedSha: "abc1234",
+  summarySha: "abc1234",
   reviewCount: 3,
-  tokens: 833431,
+  usage: { input: 29000, output: 7300, cached: 302500 },
   model: "glm-5.2",
   assessment: "Sound design.",
   findings: [
@@ -44,12 +52,37 @@ describe("state marker", () => {
   it("migrates a v1 marker so the PR keeps its incremental position", () => {
     const v1 = `<!-- AI-REVIEWER-STATE {"lastReviewedSha":"deadbee","reviewCount":2,"paused":true} -->`;
     const parsed = parseState(v1)!;
-    assert.equal(parsed.v, 2);
+    assert.equal(parsed.v, 3);
     assert.equal(parsed.lastReviewedSha, "deadbee");
     assert.equal(parsed.reviewCount, 2);
     assert.equal(parsed.paused, true);
     assert.deepEqual(parsed.findings, []);
-    assert.equal(parsed.tokens, 0);
+    assert.deepEqual(parsed.usage, { input: 0, output: 0, cached: 0 });
+  });
+
+  it("migrates cumulative v2 tokens and the visible commit into v3", () => {
+    const packed = gzipSync(
+      Buffer.from(
+        JSON.stringify({
+          v: 2,
+          lastReviewedSha: "deadbee",
+          reviewCount: 2,
+          tokens: 833431,
+          findings: [],
+          observations: [],
+          files: [],
+        }),
+      ),
+    ).toString("base64");
+    const parsed = parseState(`<!-- AI-REVIEW-STATE v2 ${packed} -->`)!;
+
+    assert.equal(parsed.v, 3);
+    assert.equal(parsed.summarySha, "deadbee");
+    assert.deepEqual(parsed.usage, {
+      input: 833431,
+      output: 0,
+      cached: 0,
+    });
   });
 
   it("returns null when there is no marker at all", () => {
@@ -71,8 +104,42 @@ describe("state marker", () => {
         p: `lib/module_${i}/file_${i}.dart`,
         k: "code" as const,
         n: 1,
+        r: `clean; regression ${i} pins a unique transition from state-${i} to state-${i + 1} without retaining the previous attempt identifier`,
       })),
     };
-    assert.ok(encodeState(big).length < 20000, `${encodeState(big).length}`);
+    big.history = ["old-one", "old-two", "old-three"].map((sha) => ({
+      sha,
+      scope: "incremental",
+      findings: big.findings.slice(0, 50),
+      observations: [],
+      files: big.files.slice(0, 150),
+    }));
+    assert.ok(encodeState(big).length < 30000, `${encodeState(big).length}`);
+  });
+
+  it("keeps three unique previous summary snapshots, newest first", () => {
+    const withHistory: ReviewState = {
+      ...STATE,
+      history: [
+        { sha: "old-one", scope: "full", findings: [], observations: [], files: [] },
+        { sha: "old-two", scope: "incremental", findings: [], observations: [], files: [] },
+        { sha: "old-three", scope: "incremental", findings: [], observations: [], files: [] },
+      ],
+    };
+
+    const history = historyWithPrevious(withHistory);
+
+    assert.deepEqual(history.map((snapshot) => snapshot.sha), [
+      "abc1234",
+      "old-one",
+      "old-two",
+    ]);
+    assert.equal(history[0].findings[0].id, "aaaaaaaa");
+    assert.deepEqual(history[0].counts, {
+      CRITICAL: 0,
+      WARNING: 1,
+      SUGGESTION: 0,
+    });
+    assert.equal(history[0].fileCount, 1);
   });
 });

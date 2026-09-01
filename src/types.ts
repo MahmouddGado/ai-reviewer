@@ -76,6 +76,12 @@ export const ObservationSchema = z.object({
   note: z.string(),
 });
 
+/** Concise evidence-backed outcome for one file in the current review pass. */
+export const FileReviewSchema = z.object({
+  path: z.string(),
+  summary: z.string().max(1000),
+});
+
 export const PRIOR_FINDING_STATUSES = [
   "resolved",
   "unresolved",
@@ -93,11 +99,13 @@ export const ReviewResultSchema = z.object({
   overall_assessment: z.string().default(""),
   findings: z.array(FindingSchema).default([]),
   observations: z.array(ObservationSchema).default([]),
+  file_reviews: z.array(FileReviewSchema).default([]),
   prior_finding_verdicts: z.array(PriorFindingVerdictSchema).default([]),
 });
 
 export type Finding = z.infer<typeof FindingSchema>;
 export type Observation = z.infer<typeof ObservationSchema>;
+export type FileReview = z.infer<typeof FileReviewSchema>;
 export type PriorFindingVerdict = z.infer<typeof PriorFindingVerdictSchema>;
 export type ReviewResult = z.infer<typeof ReviewResultSchema>;
 
@@ -112,6 +120,7 @@ export type FileKind =
   | "generated"
   | "filtered" // excluded by the user's path_filters
   | "cap" // over max_files
+  | "failed" // selected, but its model batch failed and must be retried
   | "binary"
   | "deleted";
 
@@ -136,6 +145,26 @@ export interface StoredFile {
   p: string;
   k: FileKind;
   n?: number; // issue count, `code` files only
+  r?: string; // concise outcome for this pass, e.g. what was fixed or tested
+}
+
+export interface TokenUsage {
+  input: number;
+  output: number;
+  cached: number;
+}
+
+export type ReviewScopeKind = "full" | "incremental";
+
+/** A bounded copy of a previously-authoritative summary. */
+export interface ReviewSnapshot {
+  sha: string;
+  scope: ReviewScopeKind;
+  counts?: Record<Severity, number>;
+  findings: StoredFinding[];
+  observations: StoredObservation[];
+  fileCount?: number;
+  files: StoredFile[];
 }
 
 /* The JSON Schema handed to the model as a tool. Kept in sync with the zod
@@ -217,6 +246,26 @@ export const REVIEW_TOOL_SCHEMA = {
         required: ["path", "note"],
       },
     },
+    file_reviews: {
+      type: "array",
+      description:
+        "Exactly one concise review outcome for every file in this batch, including clean files and tests.",
+      items: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "The exact repo-relative path shown in this batch.",
+          },
+          summary: {
+            type: "string",
+            description:
+              "A concise evidence-backed roster label. Start with 'clean' when the file has no surviving finding; then state what changed, which prior finding was fixed or remains, or which behavior a test pins. Never write a generic phrase such as 'looks good'.",
+          },
+        },
+        required: ["path", "summary"],
+      },
+    },
     prior_finding_verdicts: {
       type: "array",
       description:
@@ -245,5 +294,10 @@ export const REVIEW_TOOL_SCHEMA = {
       },
     },
   },
-  required: ["overall_assessment", "findings", "prior_finding_verdicts"],
+  required: [
+    "overall_assessment",
+    "findings",
+    "file_reviews",
+    "prior_finding_verdicts",
+  ],
 };

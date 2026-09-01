@@ -124,6 +124,7 @@ export function buildSystemPrompt(config: Config): string {
     "",
     "## Also required",
     "- `overall_assessment`: 2–5 sentences judging the change as a whole — name the patterns it introduces, say whether the design is sound, and end by characterising what the issues amount to. Do not re-enumerate the individual findings.",
+    "- `file_reviews`: return exactly one entry for every file in this batch, using its exact path. This drives the Files Reviewed roster. When a file has no surviving finding, start `summary` with `clean;` and then state concrete evidence: the behavior changed, the prior finding verified fixed, or the regression a test pins. When a previous finding remains, name it and say it remains open. Do not write generic labels such as `looks good`, `no issues`, or `reviewed`.",
     "- Do not invent issues. If the code is fine, return an empty `findings` array and say so in the assessment.",
     "",
     "Return your review by calling the `submit_review` tool. Do not write prose outside the tool call.",
@@ -208,9 +209,10 @@ export function verificationPrompt(): string {
     "- Keep exactly one verdict for every previous finding id supplied in the user prompt; never invent an id.",
     "- `resolved` requires visible proof that the change removes the original root cause. If that proof is incomplete, change the verdict to `unknown`, not `resolved`.",
     "- `unresolved` requires visible proof that the same root cause remains. Otherwise use `unknown`.",
+    "- Check every `file_reviews` entry against the surviving findings and verdicts. It must use an exact path from the batch, must not call a file clean when it has a surviving finding, and must not claim a prior issue was fixed without a `resolved` verdict. Keep exactly one entry per shown file.",
     "",
     "Return the `submit_review` tool call containing ONLY findings that survive every applicable check. Drop speculative, pre-existing, unanchored, generic, stylistic, or duplicate findings. Do not add new findings and do not turn uncertainty into an observation.",
     "Keep surviving fields intact unless evidence requires lowering severity, removing an unsafe suggestion, or rewriting a thin `summary`/`body` to state the concrete trigger, symbols, failure path, and consequence.",
-    "Preserve `overall_assessment`, `observations`, and the complete `prior_finding_verdicts` set unless evidence requires a correction.",
+    "Preserve `overall_assessment`, `observations`, `file_reviews`, and the complete `prior_finding_verdicts` set unless evidence requires a correction.",
   ].join("\n");
 }
