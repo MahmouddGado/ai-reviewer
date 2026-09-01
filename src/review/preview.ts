@@ -5,41 +5,47 @@
 import { renderSummaryComment } from "./render";
 
 const { body } = renderSummaryComment({
-  findings: [
-    {
-      id: "aaaaaaaa",
-      p: "lib/providers/sales_tracking_provider.dart",
-      l: 217,
-      s: "WARNING",
-      t: "Redundant `notifyListeners()` in catch + finally causes double rebuild on every error in `updateRecord`",
-    },
-    {
-      id: "bbbbbbbb",
-      p: "lib/providers/sales_tracking_provider.dart",
-      l: 346,
-      s: "WARNING",
-      t: "`confirmReview` missing `on SessionExpiredException` handler unlike all other methods in this provider",
-    },
-  ],
-  observations: [
-    {
-      p: "lib/core/errors/error_mapper.dart",
-      l: 23,
-      n: "`ErrorMapper.map()` has return type `AppFailure` but throws `SessionExpiredException` for that input. Callers must be aware of this implicit throw contract.",
-    },
-  ],
+  findings: [],
+  observations: [],
   files: [
-    { p: "assets/icons/oops.json", k: "asset" },
-    { p: "lib/core/errors/app_failure.dart", k: "code", n: 0 },
-    { p: "lib/core/errors/error_mapper.dart", k: "code", n: 0 },
-    { p: "lib/providers/base_provider.dart", k: "code", n: 0 },
-    { p: "lib/providers/sales_tracking_provider.dart", k: "code", n: 2 },
-    { p: "pubspec.lock", k: "generated" },
+    {
+      p: "lib/payment_notifier.dart",
+      k: "code",
+      n: 0,
+      r: "clean; previous stale-id finding verified fixed",
+    },
+    {
+      p: "test/payment_notifier_test.dart",
+      k: "code",
+      n: 0,
+      r: "clean; regression test pins cancel → restart behavior",
+    },
   ],
-  assessment:
-    "This is a well-structured PR that introduces a clean centralized error handling system. The `sealed class AppFailure` hierarchy, `ErrorMapper` pattern, and `GlobalErrorHandler` singleton with deduplication are well-designed. The two warnings are minor consistency issues in `SalesTrackingProvider`.",
+  assessment: "",
   model: "glm-5.2",
-  tokens: 833431,
+  usage: { input: 29000, output: 7300, cached: 302500 },
+  commit: "004a79e123",
+  scope: "incremental",
+  history: [
+    {
+      sha: "b364bc6123",
+      scope: "incremental",
+      findings: [
+        {
+          id: "aaaaaaaa",
+          p: "lib/payment_notifier.dart",
+          l: 217,
+          s: "WARNING",
+          t: "A stale payment id can survive into the next attempt and corroborate the wrong result",
+        },
+      ],
+      observations: [],
+      files: [
+        { p: "lib/payment_notifier.dart", k: "code", n: 1 },
+        { p: "test/payment_notifier_test.dart", k: "code", n: 0 },
+      ],
+    },
+  ],
 });
 
 console.log(body);

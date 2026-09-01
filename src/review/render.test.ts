@@ -6,9 +6,9 @@ import {
   buildRoster,
   countBySeverity,
   fileLabel,
+  formatCompactCount,
   formatCount,
   inferKind,
-  mergeRoster,
   renderSummaryComment,
   renderStatusLine,
 } from "./render";
@@ -51,7 +51,10 @@ function render(over: Partial<Parameters<typeof renderSummaryComment>[0]> = {}) 
     files: FILES,
     assessment: "Clean centralized error handling.",
     model: "glm-5.2",
-    tokens: 833431,
+    usage: { input: 29000, output: 7300, cached: 302500 },
+    commit: "004a79e123",
+    scope: "incremental",
+    history: [],
     ...over,
   }).body;
 }
@@ -60,7 +63,7 @@ describe("renderStatusLine", () => {
   it("reports the recommendation for each severity mix", () => {
     assert.equal(
       renderStatusLine({ CRITICAL: 0, WARNING: 0, SUGGESTION: 0 }),
-      "**Status:** No Issues Found | **Recommendation:** Approve",
+      "**Status:** No Issues Found | **Recommendation:** Merge",
     );
     assert.equal(
       renderStatusLine({ CRITICAL: 0, WARNING: 2, SUGGESTION: 0 }),
@@ -97,16 +100,29 @@ describe("renderSummaryComment", () => {
         "<summary><b>Other Observations (not in diff)</b></summary>",
       ),
     );
-    assert.ok(body.includes("<summary><b>Files Reviewed (3 files)</b></summary>"));
+    assert.ok(
+      body.includes(
+        "<summary><b>Files Reviewed (3 files — incremental pass on 004a79e)</b></summary>",
+      ),
+    );
     assert.ok(body.includes("- `assets/icons/oops.json` - asset file"));
     assert.ok(
       body.includes("- `lib/providers/sales_tracking_provider.dart` - 2 issues"),
     );
-    assert.ok(body.includes("- `lib/core/errors/app_failure.dart` - 0 issues"));
+    assert.ok(body.includes("- `lib/core/errors/app_failure.dart` - clean"));
+    assert.ok(!body.includes("Overall Assessment"));
+    assert.ok(
+      body.endsWith(
+        "<sub>Reviewed by glm-5.2 · Input: 29K · Output: 7.3K · Cached: 302.5K</sub>",
+      ),
+    );
+  });
+
+  it("keeps the overall assessment on a full review", () => {
+    const body = render({ scope: "full" });
     assert.ok(
       body.includes("**Overall Assessment:** Clean centralized error handling."),
     );
-    assert.ok(body.endsWith("<sub>Reviewed by glm-5.2 · 833,431 tokens</sub>"));
   });
 
   it("keeps a blank line after </summary> so GitHub renders the tables", () => {
@@ -118,7 +134,7 @@ describe("renderSummaryComment", () => {
       findings: [],
       observations: [],
       files: [],
-      tokens: 0,
+      usage: { input: 0, output: 0, cached: 0 },
       assessment: "",
     });
     assert.ok(body.includes("**Status:** No Issues Found"));
@@ -129,11 +145,50 @@ describe("renderSummaryComment", () => {
     assert.ok(body.endsWith("<sub>Reviewed by glm-5.2</sub>"));
   });
 
+  it("renders the current pass outcomes and bounded prior snapshots", () => {
+    const body = render({
+      findings: [],
+      observations: [],
+      assessment: "",
+      files: [
+        {
+          p: "lib/payment_notifier.dart",
+          k: "code",
+          n: 0,
+          r: "clean; previous stale-id finding verified fixed",
+        },
+      ],
+      history: [
+        {
+          sha: "b364bc6123",
+          scope: "incremental",
+          findings: WARNINGS,
+          observations: [],
+          files: FILES,
+        },
+      ],
+    });
+
+    assert.ok(body.includes("- `lib/payment_notifier.dart` - clean; previous stale-id finding verified fixed"));
+    assert.ok(body.includes("<!-- kilo-review-history -->"));
+    assert.ok(body.includes("Previous Review Summaries</b> (1 snapshot, latest commit b364bc6)"));
+    assert.ok(body.includes("### Previous review (commit b364bc6)"));
+    assert.ok(body.includes("_Current summary above is authoritative."));
+    assert.ok(body.includes("<!-- /kilo-review-history -->"));
+    assert.ok(!body.includes("### Overview\n| Severity | Count |\n|----------|-------|\n| CRITICAL | 0 |\n| WARNING | 0 |"));
+  });
+
   it("escapes pipes so a title can't shatter the table row", () => {
     const body = render({
-      findings: [{ ...WARNINGS[0], t: "use `a | b`\nnot `a || b`" }],
+      findings: [
+        { ...WARNINGS[0], t: "use `a | b`\nnot `a || b` or <details>" },
+      ],
     });
-    assert.ok(body.includes("| use `a \\| b` not `a \\|\\| b` |"));
+    assert.ok(
+      body.includes(
+        "| use `a \\| b` not `a \\|\\| b` or &lt;details&gt; |",
+      ),
+    );
   });
 
   it("groups issue tables by severity, most severe first", () => {
@@ -166,7 +221,10 @@ describe("renderSummaryComment", () => {
         files,
         assessment: "x",
         model: "glm-5.2",
-        tokens: 1,
+        usage: { input: 1, output: 0, cached: 0 },
+        commit: "abc1234",
+        scope: "full",
+        history: [],
       },
       20000,
     );
@@ -181,10 +239,11 @@ describe("renderSummaryComment", () => {
 describe("roster", () => {
   it("labels dropped files by reason and reviewed files by count", () => {
     const roster = buildRoster(
-      ["a.dart", "pkg.lock", "assets/icons/oops.json", "big.dart"],
+      ["a.dart", "pkg.lock", "assets/icons/oops.json", "big.dart", "failed.dart"],
       new Map([
         ["pkg.lock", "generated" as const],
         ["big.dart", "cap" as const],
+        ["failed.dart", "failed" as const],
       ]),
       new Map([["a.dart", 2]]),
     );
@@ -192,30 +251,16 @@ describe("roster", () => {
     assert.equal(label("a.dart"), "2 issues");
     assert.equal(label("pkg.lock"), "generated file");
     assert.equal(label("big.dart"), "not reviewed (max_files)");
+    assert.equal(label("failed.dart"), "review failed (will retry)");
     assert.equal(label("assets/icons/oops.json"), "asset file");
   });
 
-  it("recomputes counts from findings rather than summing across runs", () => {
-    const merged = mergeRoster(
-      [{ p: "a.dart", k: "code", n: 1 }],
-      [{ p: "a.dart", k: "code", n: 1 }],
-    );
-    const applied = applyIssueCounts(merged, [
+  it("recomputes roster counts from the authoritative finding set", () => {
+    const applied = applyIssueCounts([{ p: "a.dart", k: "code", n: 0 }], [
       { id: "x", p: "a.dart", l: 1, s: "WARNING", t: "t" },
     ]);
     assert.equal(applied.length, 1);
     assert.equal(applied[0].n, 1);
-  });
-
-  it("keeps files from earlier runs that this run did not touch", () => {
-    const merged = mergeRoster(
-      [{ p: "old.dart", k: "code", n: 0 }],
-      [{ p: "new.dart", k: "code", n: 1 }],
-    );
-    assert.deepEqual(
-      merged.map((f) => f.p).sort(),
-      ["new.dart", "old.dart"],
-    );
   });
 
   it("infers asset and generated kinds from the path", () => {
@@ -240,5 +285,9 @@ describe("helpers", () => {
     assert.equal(formatCount(0), "0");
     assert.equal(formatCount(999), "999");
     assert.equal(formatCount(1000), "1,000");
+    assert.equal(formatCompactCount(999), "999");
+    assert.equal(formatCompactCount(7300), "7.3K");
+    assert.equal(formatCompactCount(29000), "29K");
+    assert.equal(formatCompactCount(1_250_000), "1.3M");
   });
 });

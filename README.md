@@ -13,8 +13,8 @@ suggestions.
 
 - **Automatic reviews** on PR open and on every push (incremental — only the new changes).
 - **One sticky summary comment**, rewritten in place on every commit and always describing the
-  **whole PR**: severity counts, issue tables, out-of-diff observations, the reviewed-files roster,
-  an overall assessment, and running token spend.
+  **current state of the whole PR**: open issue totals, evidence-backed outcomes for the current
+  pass, three prior summary snapshots, a full-review assessment, and split input/output/cache usage.
 - **Inline findings** in the form `**WARNING:** <title>` followed by an explanation that names the
   symbols involved and traces the actual failure path.
 - **Severity**: `CRITICAL` / `WARNING` / `SUGGESTION`.
@@ -41,11 +41,20 @@ The sticky comment:
 
 <details><summary><b>Issue Details (click to expand)</b></summary> … per-severity tables …
 <details><summary><b>Other Observations (not in diff)</b></summary> … </details>
-<details><summary><b>Files Reviewed (41 files)</b></summary> … `path` - N issues … </details>
+<details><summary><b>Files Reviewed (4 files — incremental pass on 004a79e)</b></summary>
+
+- `lib/payment_notifier.dart` - clean; previous stale-id finding verified fixed
+- `test/payment_notifier_test.dart` - clean; regression test pins cancel → restart behavior
+
+</details>
+
+<details><summary><b>Previous Review Summaries</b> (3 snapshots, latest commit b364bc6)</summary>
+…the previously-authoritative status, findings, and file roster…
+</details>
 
 **Overall Assessment:** …
 
-<sub>Reviewed by glm-5.2 · 833,431 tokens</sub>
+<sub>Reviewed by glm-5.2 · Input: 29K · Output: 7.3K · Cached: 302.5K</sub>
 ```
 
 Run `npm run preview` to print a full rendered example without touching the API or GitHub.
@@ -98,10 +107,10 @@ event → router → orchestrator:
   3. fetch diff, parse hunks → commentable line set (prevents 422s)
   4. select files (path filters, optional max_files cap), recording why each was dropped
   5. split into batches of <= batch_chars so an unlimited file count still fits a request
-  6. model review per batch → new findings + verdicts for relevant findings from earlier commits
+  6. model review per batch → new findings, per-file outcomes, and prior-finding verdicts
   7. verification pass per batch (drop false positives and re-check resolution verdicts)
   8. post inline comments (deduped by a hidden per-finding id)
-  9. merge into the running totals, then upsert the sticky summary comment
+  9. merge open findings, snapshot the previous summary, then upsert the sticky comment
 ```
 
 ### Staying accurate across commits
@@ -121,12 +130,15 @@ The summary is cumulative, so it needs to know which findings are still open:
 - Observations have no comment to track, so they're re-evaluated whenever their file is reviewed
   again — file-level granularity is the honest limit there.
 - `@bot full review` resets the totals and rebuilds from scratch.
+- The current roster describes only the latest pass; up to three prior authoritative summaries are
+  retained in a collapsed history section. Failed batches are marked for retry and do not advance
+  the completed-review SHA.
 
-State lives in a hidden, gzipped+base64 `<!-- AI-REVIEW-STATE v2 … -->` marker on the sticky comment,
+State lives in a hidden, gzipped+base64 `<!-- AI-REVIEW-STATE v3 … -->` marker on the sticky comment,
 which is how a stateless Action remembers what it already reviewed. It's encoded rather than raw JSON
 because findings quote real code, and a title containing `-->` would otherwise close the HTML comment
-early and corrupt the page. v1 markers are migrated automatically, so PRs opened under an older build
-keep their position instead of being re-reviewed from scratch.
+early and corrupt the page. v1 and v2 markers are migrated automatically, so PRs opened under an older
+build keep their position instead of being re-reviewed from scratch.
 
 ## Architecture
 

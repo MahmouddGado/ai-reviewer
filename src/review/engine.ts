@@ -1,6 +1,7 @@
 import * as core from "@actions/core";
 import Anthropic from "@anthropic-ai/sdk";
 import {
+  FileReviewSchema,
   FindingSchema,
   PriorFindingVerdictSchema,
   REVIEW_TOOL_SCHEMA,
@@ -20,7 +21,7 @@ const DEFAULT_MAX_TOKENS = 32000;
 export interface CallUsage {
   input: number;
   output: number;
-  total: number;
+  cached: number;
 }
 
 export interface EngineResult {
@@ -147,6 +148,12 @@ function salvage(input: unknown): ReviewResult {
         return one.success ? [one.data] : [];
       })
     : [];
+  const fileReviews = Array.isArray(raw.file_reviews)
+    ? raw.file_reviews.flatMap((review) => {
+        const one = FileReviewSchema.safeParse(review);
+        return one.success ? [one.data] : [];
+      })
+    : [];
 
   if (findings.length > 0 || priorVerdicts.length > 0) {
     core.warning(
@@ -159,6 +166,7 @@ function salvage(input: unknown): ReviewResult {
       typeof raw.overall_assessment === "string" ? raw.overall_assessment : "",
     findings,
     observations: [],
+    file_reviews: fileReviews,
     prior_finding_verdicts: priorVerdicts,
   });
 }
@@ -170,11 +178,11 @@ function salvage(input: unknown): ReviewResult {
 function readUsage(response: Anthropic.Message): CallUsage {
   const u = (response as any).usage ?? {};
   const input =
-    num(u.input_tokens) +
-    num(u.cache_creation_input_tokens) +
-    num(u.cache_read_input_tokens);
+    num(u.input_tokens);
   const output = num(u.output_tokens);
-  return { input, output, total: input + output };
+  const cached =
+    num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens);
+  return { input, output, cached };
 }
 
 function num(v: unknown): number {

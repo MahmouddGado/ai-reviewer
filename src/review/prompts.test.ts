@@ -119,6 +119,8 @@ describe("review prompts", () => {
     assert.ok(prompt.includes("Applicable visible guards, types, callers"));
     assert.ok(prompt.includes("not a duplicate symptom"));
     assert.ok(prompt.includes("Remove the suggestion if uncertain"));
+    assert.ok(prompt.includes("Check every `file_reviews` entry"));
+    assert.ok(prompt.includes("must not call a file clean"));
     assert.ok(prompt.includes("Do not add new findings"));
     assert.ok(prompt.includes("change the verdict to `unknown`"));
     assert.ok(prompt.includes("complete `prior_finding_verdicts` set"));

@@ -4,6 +4,8 @@ import { DiffFile } from "../github/diff";
 import { DEFAULT_STATE, ReviewState } from "../github/state";
 import { ExistingComments } from "../github/review";
 import {
+  advance,
+  buildFileReviewNotes,
   priorFindingAliases,
   priorFindingsForBatch,
   withRenamedPaths,
@@ -137,5 +139,64 @@ describe("incremental orchestration helpers", () => {
     assert.deepEqual(next.findings.map((finding) => finding.p), ["stay.ts"]);
     assert.deepEqual(next.observations.map((note) => note.p), ["stay.ts"]);
     assert.deepEqual(next.files.map((file) => file.p), ["stay.ts"]);
+  });
+
+  it("turns verified verdicts and test evidence into clean file outcomes", () => {
+    const notes = buildFileReviewNotes(
+      [
+        {
+          path: "src/new-name.ts",
+          summary: "the new regression test pins retry cancellation",
+        },
+      ],
+      [
+        {
+          id: "keep",
+          status: "resolved",
+          reason: "The loop now stops after three attempts.",
+        },
+      ],
+      [
+        {
+          id: "keep",
+          path: "src/new-name.ts",
+          line: 18,
+          severity: "WARNING",
+          title: "Unbounded retry loop",
+          summary: "The retry loop can run forever.",
+        },
+      ],
+      new Map(),
+    );
+
+    assert.equal(
+      notes.get("src/new-name.ts"),
+      "clean; the new regression test pins retry cancellation; previous `Unbounded retry loop` finding verified fixed (The loop now stops after three attempts.)",
+    );
+  });
+
+  it("does not advance the completed SHA when part of a pass failed", () => {
+    const next = advance(
+      { ...DEFAULT_STATE, lastReviewedSha: "old-sha" },
+      {
+        number: 1,
+        title: "Retry safely",
+        body: "",
+        baseRef: "main",
+        headRef: "feature",
+        baseSha: "base-sha",
+        headSha: "new-sha",
+        draft: false,
+      },
+      { input: 10, output: 5, cached: 20 },
+      true,
+      "incremental",
+      false,
+    );
+
+    assert.equal(next.lastReviewedSha, "old-sha");
+    assert.equal(next.summarySha, "new-sha");
+    assert.equal(next.reviewCount, 1);
+    assert.deepEqual(next.usage, { input: 10, output: 5, cached: 20 });
   });
 });
