@@ -25,17 +25,17 @@ jobs:
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository &&
        github.actor != 'dependabot[bot]') ||
-      (github.event_name == 'issue_comment' &&
+      (github.eve
+      name == 'issue_comment' &&
        github.event.issue.pull_request &&
        contains(github.event.comment.body, '@bot') &&
        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      # Merge the new implementation into main before using this example.
-      # You can replace main with a release tag or commit containing that version.
+      # Follow the published v1 release. Use a commit SHA for an immutable version.
       - name: Review pull request
-        uses: MahmouddGado/ai-reviewer@main
+        uses: MahmouddGado/ai-reviewer@v1
         with:
           api_key: ${{ secrets.ZAI_API_KEY }}
           github_token: ${{ github.token }}
