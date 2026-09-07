@@ -1,5 +1,6 @@
 import * as core from "@actions/core";
 import Anthropic from "@anthropic-ai/sdk";
+import { callOpenAI } from "./openai";
 import {
   FileReviewSchema,
   FindingSchema,
@@ -27,16 +28,18 @@ export interface CallUsage {
 export interface EngineResult {
   result: ReviewResult;
   usage: CallUsage;
+  incomplete?: boolean;
 }
 
 export class ReviewEngine {
   private client: Anthropic;
   private maxTokens: number;
   constructor(
-    apiKey: string,
+    private readonly apiKey: string,
     public readonly model: string,
-    baseURL?: string,
+    private readonly baseURL?: string,
     maxTokens?: number,
+    private readonly protocol: "anthropic" | "openai" = "anthropic",
   ) {
     // baseURL points the Anthropic SDK at z.ai's Anthropic-compatible endpoint
     // (https://api.z.ai/api/anthropic) so GLM models work with no code changes.
@@ -86,7 +89,9 @@ export class ReviewEngine {
     system: string,
     messages: Anthropic.MessageParam[],
   ): Promise<EngineResult> {
-    const response = await this.client.messages.create({
+    const response = this.protocol === "openai"
+      ? await callOpenAI(this.apiKey, this.baseURL ?? "https://api.z.ai/api/coding/paas/v4", this.model, this.maxTokens, system, messages)
+      : await this.client.messages.create({
       model: this.model,
       max_tokens: this.maxTokens,
       system,
@@ -98,7 +103,7 @@ export class ReviewEngine {
           input_schema: REVIEW_TOOL_SCHEMA as any,
         },
       ],
-      tool_choice: { type: "tool", name: TOOL_NAME },
+      tool_choice: this.model === "glm-5.3" ? { type: "auto" } : { type: "tool", name: TOOL_NAME },
       messages,
     });
 
@@ -111,21 +116,21 @@ export class ReviewEngine {
     }
 
     const toolUse = response.content.find(
-      (c): c is Anthropic.ToolUseBlock => c.type === "tool_use",
+      (c): c is Anthropic.ToolUseBlock => c.type === "tool_use" && c.name === TOOL_NAME,
     );
     if (!toolUse) {
       throw new Error("Model did not return a submit_review tool call.");
     }
 
     const parsed = ReviewResultSchema.safeParse(toolUse.input);
-    if (parsed.success) return { result: parsed.data, usage };
+    if (parsed.success) return { result: parsed.data, usage, incomplete: response.stop_reason === "max_tokens" };
 
     core.warning(
       `Model output failed validation: ${parsed.error.issues
         .map((i) => i.message)
         .join("; ")}`,
     );
-    return { result: salvage(toolUse.input), usage };
+    return { result: salvage(toolUse.input), usage, incomplete: true };
   }
 }
 

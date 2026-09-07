@@ -16,9 +16,11 @@ async function run(): Promise<void> {
       core.getInput("api_key") || core.getInput("anthropic_api_key");
     if (!apiKey) throw new Error("Input required and not supplied: api_key");
     const token = core.getInput("github_token", { required: true });
-    const model = core.getInput("model") || "glm-5.2";
+    const model = core.getInput("model") || "glm-5.3";
+    const protocol = core.getInput("api_protocol") || "anthropic";
+    if (protocol !== "anthropic" && protocol !== "openai") throw new Error("api_protocol must be anthropic or openai");
     const baseUrl =
-      core.getInput("base_url") || "https://api.z.ai/api/anthropic";
+      core.getInput("base_url") || (protocol === "openai" ? "https://api.z.ai/api/coding/paas/v4" : "https://api.z.ai/api/anthropic");
     const configPath = core.getInput("config_path") || ".aireviewer.yaml";
 
     // An unset input is "", which must stay undefined so .aireviewer.yaml wins.
@@ -46,6 +48,7 @@ async function run(): Promise<void> {
       model,
       baseUrl,
       intInput("max_output_tokens"),
+      protocol,
     );
 
     const pull_number = await resolvePrNumber(octokit, repo, ctx);

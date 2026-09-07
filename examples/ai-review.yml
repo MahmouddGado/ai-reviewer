@@ -1,11 +1,10 @@
-# Copy this into a consuming repo at: .github/workflows/ai-review.yml
+# Copy to .github/workflows/ai-review.yml in the repository to review.
 name: AI Code Review
+
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
-    types: [created]
-  pull_request_review_comment:
     types: [created]
 
 permissions:
@@ -13,18 +12,37 @@ permissions:
   pull-requests: write
   issues: write
 
+# Serialize reviews for each PR so concurrent runs cannot overwrite its history.
 concurrency:
-  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: ai-review-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: false
 
 jobs:
   review:
+    # Fork PRs do not receive ZAI_API_KEY. Comment commands require write-level
+    # association and a PR, avoiding runs on ordinary issue comments or bot replies.
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.actor != 'dependabot[bot]') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       contains(github.event.comment.body, '@bot') &&
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: MahmouddGado/ai-reviewer@v1
+      # Merge the new implementation into main before using this example.
+      # You can replace main with a release tag or commit containing that version.
+      - name: Review pull request
+        uses: MahmouddGado/ai-reviewer@main
         with:
-          api_key: ${{ secrets.ZAI_API_KEY }}          # z.ai API key
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          model: glm-5.2                                # z.ai GLM 5.2
-          max_files: 0                                  # review every changed file
-          # base_url defaults to https://api.z.ai/api/anthropic
+          api_key: ${{ secrets.ZAI_API_KEY }}
+          github_token: ${{ github.token }}
+          model: glm-5.3
+          api_protocol: anthropic
+          # For GLM Coding Plan accounts, set api_protocol: openai instead.
+          # base_url is selected automatically from api_protocol.
+          config_path: .aireviewer.yaml
+          max_output_tokens: 32000
+          # File limits, chunk size, and verification are configured in the YAML below.

@@ -159,6 +159,9 @@ export type ReviewScopeKind = "full" | "incremental";
 /** A bounded copy of a previously-authoritative summary. */
 export interface ReviewSnapshot {
   sha: string;
+  assessment?: string;
+  model?: string;
+  usage?: TokenUsage;
   scope: ReviewScopeKind;
   counts?: Record<Severity, number>;
   findings: StoredFinding[];

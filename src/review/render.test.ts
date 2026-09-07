@@ -50,7 +50,7 @@ function render(over: Partial<Parameters<typeof renderSummaryComment>[0]> = {}) 
     observations: OBSERVATIONS,
     files: FILES,
     assessment: "Clean centralized error handling.",
-    model: "glm-5.2",
+    model: "glm-5.3",
     usage: { input: 29000, output: 7300, cached: 302500 },
     commit: "004a79e123",
     scope: "incremental",
@@ -81,6 +81,11 @@ describe("renderStatusLine", () => {
 });
 
 describe("renderSummaryComment", () => {
+  it("never recommends merge when a chunk failed", () => {
+    const body = render({ findings: [], files: [{ p: "large.ts", k: "failed" }] });
+    assert.match(body, /Review Incomplete/);
+    assert.ok(!body.includes("**Recommendation:** Merge"));
+  });
   it("produces the Kilo block", () => {
     const body = render();
     assert.match(body, /^## Code Review Summary\n/);
@@ -113,7 +118,7 @@ describe("renderSummaryComment", () => {
     assert.ok(!body.includes("Overall Assessment"));
     assert.ok(
       body.endsWith(
-        "<sub>Reviewed by glm-5.2 · Input: 29K · Output: 7.3K · Cached: 302.5K</sub>",
+        "<sub>Reviewed by glm-5.3 · Input: 29K · Output: 7.3K · Cached: 302.5K</sub>",
       ),
     );
   });
@@ -142,7 +147,7 @@ describe("renderSummaryComment", () => {
     assert.ok(!body.includes("Other Observations"));
     assert.ok(!body.includes("Files Reviewed"));
     assert.ok(!body.includes("Overall Assessment"));
-    assert.ok(body.endsWith("<sub>Reviewed by glm-5.2</sub>"));
+    assert.ok(body.endsWith("<sub>Reviewed by glm-5.3</sub>"));
   });
 
   it("renders the current pass outcomes and bounded prior snapshots", () => {
@@ -220,7 +225,7 @@ describe("renderSummaryComment", () => {
         observations: [],
         files,
         assessment: "x",
-        model: "glm-5.2",
+        model: "glm-5.3",
         usage: { input: 1, output: 0, cached: 0 },
         commit: "abc1234",
         scope: "full",

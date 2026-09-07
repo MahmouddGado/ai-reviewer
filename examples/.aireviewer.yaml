@@ -1,24 +1,31 @@
-# Copy to the ROOT of a consuming repo as `.aireviewer.yaml`. All keys are optional.
-profile: chill               # quiet | chill | assertive
-max_files: 0                 # 0 = no limit; review every changed file
-batch_chars: 200000          # diff chars per model request (files are split, never dropped)
-review_generated: false      # true also reviews lock files, dist/, minified bundles
+# Copy to .aireviewer.yaml at the root of the repository to review.
+# The model, API protocol, and API key belong in the workflow's `with` section.
+profile: chill
+
+# Review every selected file, splitting large diffs across model requests.
+max_files: 0
+batch_chars: 200000
+review_generated: false
+verification: true
 
 auto_review:
   enabled: true
   drafts: false
-  base_branches: ["main", "master", "release/.*"]   # regex, anchored
+  # These are anchored regular expressions matching the PR's target branch.
+  base_branches: ["main", "master", "release/.*"]
   ignore_title_keywords: ["WIP", "[skip review]"]
 
 path_filters:
-  - "!**/*.lock"
-  - "!dist/**"
+  - "!**/node_modules/**"
+  - "!**/dist/**"
+  - "!**/build/**"
   - "!**/__generated__/**"
 
-path_instructions:
-  - path: "src/api/**"
-    instructions: "Require input validation and typed error handling."
-  - path: "**/*.test.ts"
-    instructions: "Flag missing edge-case assertions."
+# Add repository-specific guidance when needed, for example:
+# path_instructions:
+#   - path: "src/api/**"
+#     instructions: "Check authorization, input validation, and error handling."
+path_instructions: []
 
-verification: true
+# Summary behavior is automatic: one fresh block per review, with the previous
+# three blocks in collapsed history, newest first. Findings are not carried over.

@@ -22,7 +22,7 @@ const { body } = renderSummaryComment({
     },
   ],
   assessment: "",
-  model: "glm-5.2",
+  model: "glm-5.3",
   usage: { input: 29000, output: 7300, cached: 302500 },
   commit: "004a79e123",
   scope: "incremental",

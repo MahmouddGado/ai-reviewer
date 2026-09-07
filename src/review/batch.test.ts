@@ -4,6 +4,8 @@ import { Config, ConfigSchema } from "../types";
 import { DiffFile } from "../github/diff";
 import { planBatches } from "./batch";
 import { selectFiles } from "./chunker";
+import { buildInlineComments } from "../github/review";
+import { Finding } from "../types";
 
 function file(path: string, renderedChars: number): DiffFile {
   return {
@@ -40,15 +42,31 @@ describe("planBatches", () => {
     assert.equal(new Set(seen).size, 20);
   });
 
-  it("gives an oversized file its own batch rather than truncating it", () => {
+  it("splits an oversized file without truncating its content", () => {
     const files = [file("small.ts", 100), file("huge.ts", 50000)];
     const batches = planBatches(files, 5000);
-    const huge = batches.find((b) => b.some((f) => f.path === "huge.ts"));
-    assert.ok(huge);
-    assert.equal(huge!.length, 1);
-    assert.equal(huge![0].rendered.length, 50000, "content must be intact");
+    const huge = batches.flat().filter((f) => f.path === "huge.ts");
+    assert.ok(huge.length > 1);
+    assert.equal(huge.map((f) => f.rendered).join(""), files[1].rendered);
+    for (const batch of batches) {
+      assert.ok(batch.reduce((size, f) => size + f.rendered.length + f.path.length + 128, 0) <= 5000);
+    }
     // and the small file is still reviewed
     assert.ok(batches.flat().some((f) => f.path === "small.ts"));
+  });
+
+  it("preserves original line numbers across large hunks", () => {
+    const source = file("a.ts", 0);
+    source.rendered = "@@ -1,30 +1,30 @@\n" + Array.from({ length: 30 }, (_, i) => `${String(i + 1).padStart(5)} + statement${i};\n`).join("");
+    source.commentableLines = new Set(Array.from({ length: 30 }, (_, i) => i + 1));
+    const parts = planBatches([source], 300).flat();
+    assert.ok(parts.length > 1);
+    assert.equal(parts.map((part) => part.rendered).join(""), source.rendered);
+    assert.deepEqual(new Set(parts.flatMap((part) => [...part.commentableLines])), source.commentableLines);
+    assert.deepEqual(parts.map((part) => part.part?.index), parts.map((_, i) => i + 1));
+    const findings: Finding[] = [1, 30].map((line) => ({ path: source.path, line, severity: "WARNING", category: "bug", title: `Problem ${line}`, summary: "Problem", body: "Explanation" }));
+    const comments = buildInlineComments(findings, parts, { byId: new Map(), legacy: new Set() });
+    assert.equal(comments.comments.length, 2, "anchors in early and late chunks both survive");
   });
 
   it("returns no batches for no files", () => {

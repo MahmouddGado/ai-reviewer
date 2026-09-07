@@ -1,7 +1,6 @@
 # AI Reviewer
 
-A CodeRabbit-style AI code reviewer packaged as a GitHub Action, powered by **z.ai GLM 5.2** (via its
-Anthropic-compatible endpoint). It reviews every pull request and **re-reviews incrementally on each
+A CodeRabbit-style AI code reviewer packaged as a GitHub Action, powered by **z.ai GLM-5.3**. It reviews every pull request and **re-reviews incrementally on each
 new commit**, keeping a single summary comment up to date and posting inline, one-click committable
 suggestions.
 
@@ -9,12 +8,21 @@ suggestions.
 > GLM models work with no code changes. Swap `model:` (e.g. `glm-4.6`) and `base_url:` to use any
 > Anthropic-compatible provider — including Anthropic itself (`model: claude-sonnet-5`, drop `base_url`).
 
+For accounts with a current or past GLM Coding Plan subscription, Z.ai currently requires the
+OpenAI-compatible protocol for GLM-5.3. Set `api_protocol: openai`; the default endpoint becomes
+`https://api.z.ai/api/coding/paas/v4`. Otherwise the default remains `api_protocol: anthropic`
+with `https://api.z.ai/api/anthropic`. An explicit `base_url` overrides either default.
+See [Z.ai's GLM-5.3 protocol and account requirements](https://docs.z.ai/guides/llm/glm-5.3).
+
 ## Features
 
 - **Automatic reviews** on PR open and on every push (incremental — only the new changes).
-- **One sticky summary comment**, rewritten in place on every commit and always describing the
-  **current state of the whole PR**: open issue totals, evidence-backed outcomes for the current
-  pass, three prior summary snapshots, a full-review assessment, and split input/output/cache usage.
+- **One sticky summary comment**, replaced with a fresh, independent review on each pass:
+  findings and file outcomes from that pass only, followed by three previous review blocks,
+  newest first. Previous findings are not added to the new summary.
+- **Bounded chunks**, splitting oversized files at hunk and line boundaries. Results from all
+  chunks in a pass become one summary. Failed or truncated chunks mark the review incomplete.
+- **Per-review usage**: input, output, and cache tokens stay with the review that used them.
 - **Inline findings** in the form `**WARNING:** <title>` followed by an explanation that names the
   symbols involved and traces the actual failure path.
 - **Severity**: `CRITICAL` / `WARNING` / `SUGGESTION`.
@@ -54,7 +62,7 @@ The sticky comment:
 
 **Overall Assessment:** …
 
-<sub>Reviewed by glm-5.2 · Input: 29K · Output: 7.3K · Cached: 302.5K</sub>
+<sub>Reviewed by glm-5.3 · Input: 29K · Output: 7.3K · Cached: 302.5K</sub>
 ```
 
 Run `npm run preview` to print a full rendered example without touching the API or GitHub.
@@ -106,33 +114,34 @@ event → router → orchestrator:
   2. resolve scope: full (opened) vs incremental (synchronize → lastReviewedSha...head)
   3. fetch diff, parse hunks → commentable line set (prevents 422s)
   4. select files (path filters, optional max_files cap), recording why each was dropped
-  5. split into batches of <= batch_chars so an unlimited file count still fits a request
+  5. split diffs into chunks of <= batch_chars, including oversized files
   6. model review per batch → new findings, per-file outcomes, and prior-finding verdicts
   7. verification pass per batch (drop false positives and re-check resolution verdicts)
   8. post inline comments (deduped by a hidden per-finding id)
-  9. merge open findings, snapshot the previous summary, then upsert the sticky comment
+  9. combine this pass's results, archive the previous summary, replace the current block
 ```
 
 ### Staying accurate across commits
 
-The summary is cumulative, so it needs to know which findings are still open:
+Every summary describes one review pass. The latest block is first, followed by the previous
+three blocks in newest-first order. Historical findings never inflate the latest issue totals:
 
 - Every inline comment carries a hidden `<!-- air-id:… -->` derived from *path + title* — not the
   line — so a finding that drifts down the file is still recognised as the same finding rather than
   posted twice.
 - On each new commit, findings from earlier reviews are supplied to the model alongside the
   incremental diff for their changed files. Each receives a `resolved`, `unresolved`, or `unknown`
-  verdict. Only an explicit `resolved` verdict removes it from the totals; missing context keeps it.
+  verdict for per-file fix notes. Only findings actually reported in this pass appear in its totals.
 - GitHub's **outdated** flag means an anchor changed, not that the bug was fixed. If the issue remains,
   the action can post a refreshed comment on the new commit; live comments are still deduplicated.
-- Surviving live findings have their line refreshed from GitHub, so the table tracks the file as it
-  moves. Findings and observations are removed immediately when their file is deleted.
-- Observations have no comment to track, so they're re-evaluated whenever their file is reviewed
-  again — file-level granularity is the honest limit there.
-- `@bot full review` resets the totals and rebuilds from scratch.
+- Findings and observations in previous blocks remain as recorded, even when files move or are deleted.
+- `@bot full review` creates a new independent review of the entire PR, archiving the previous block
+  even when the commit SHA is unchanged. Repeated automatic events for a completed SHA do no work.
 - The current roster describes only the latest pass; up to three prior authoritative summaries are
-  retained in a collapsed history section. Failed batches are marked for retry and do not advance
-  the completed-review SHA.
+  retained in a collapsed history section. Failed or truncated chunks are marked for retry and do
+  not advance the completed-review SHA. The next run retries from the last completed checkpoint.
+  The character budget covers rendered diff content and file headings; instructions and verification
+  responses add request overhead. Exceptionally long individual lines may span fragments.
 
 State lives in a hidden, gzipped+base64 `<!-- AI-REVIEW-STATE v3 … -->` marker on the sticky comment,
 which is how a stateless Action remembers what it already reviewed. It's encoded rather than raw JSON
@@ -152,7 +161,9 @@ build keep their position instead of being re-reviewed from scratch.
 | `src/review/scope.ts` | Full vs incremental range resolution |
 | `src/review/chunker.ts` | File selection, with a drop reason per file |
 | `src/review/engine.ts` | Model calls (review + verify) via tool use; token accounting |
-| `src/review/accumulate.ts` | Merge/expire findings and observations across commits (pure) |
+| `src/review/accumulate.ts` | Normalize and deduplicate findings and observations (pure) |
+| `src/review/batch.ts` | Split large diffs and pack bounded chunks |
+| `src/review/openai.ts` | OpenAI-compatible transport for Coding Plan accounts |
 | `src/review/render.ts` | Summary-comment markdown (pure, unit-tested) |
 | `src/review/orchestrator.ts` | The 8-step flow |
 | `src/commands/handler.ts` | `@bot` command parsing & handling |

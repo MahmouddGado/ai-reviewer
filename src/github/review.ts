@@ -110,7 +110,12 @@ export function buildInlineComments(
   unanchored: Finding[];
   duplicates: Finding[];
 } {
-  const byPath = new Map(diffFiles.map((f) => [f.path, f.commentableLines]));
+  const byPath = new Map<string, Set<number>>();
+  for (const file of diffFiles) {
+    const lines = byPath.get(file.path) ?? new Set<number>();
+    for (const line of file.commentableLines) lines.add(line);
+    byPath.set(file.path, lines);
+  }
   const comments: InlineComment[] = [];
   const unanchored: Finding[] = [];
   const duplicates: Finding[] = [];

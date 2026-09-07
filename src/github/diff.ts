@@ -12,6 +12,7 @@ export interface DiffFile {
   rendered: string;
   additions: number;
   deletions: number;
+  part?: { index: number; total: number };
 }
 
 /** Fetch the unified diff for a full PR. */

@@ -4,7 +4,6 @@ import { Octokit, Repo } from "./client";
 import {
   ReviewScopeKind,
   ReviewSnapshot,
-  SEVERITIES,
   StoredFile,
   StoredFinding,
   StoredObservation,
@@ -14,9 +13,8 @@ import {
 /**
  * Persistent per-PR state lives inside a single hidden marker embedded in the
  * bot's sticky summary comment. GitHub Actions are stateless between runs, so
- * this marker is how we remember the last-reviewed SHA and — since v2 — the
- * accumulated findings that make the summary describe the whole PR rather than
- * just the newest commit. v3 also keeps bounded prior-summary snapshots.
+ * this marker remembers the last completed SHA, the current independent review,
+ * and bounded prior-summary snapshots. Older cumulative states remain readable.
  */
 export interface ReviewState {
   v: number;
@@ -25,7 +23,7 @@ export interface ReviewState {
   summarySha: string | null;
   reviewCount: number;
   paused: boolean;
-  /** Cumulative uncached input, output, and cache-token usage for this PR. */
+  /** Input, output, and cache-token usage for the current review. */
   usage: TokenUsage;
   model: string;
   assessment: string;
@@ -133,6 +131,9 @@ export function historyWithPrevious(state: ReviewState): ReviewSnapshot[] {
 
   const snapshot: ReviewSnapshot = {
     sha,
+    assessment: state.assessment,
+    model: state.model,
+    usage: { ...state.usage },
     scope: state.scope,
     counts: {
       CRITICAL: state.findings.filter((finding) => finding.s === "CRITICAL")
@@ -142,17 +143,12 @@ export function historyWithPrevious(state: ReviewState): ReviewSnapshot[] {
       SUGGESTION: state.findings.filter((finding) => finding.s === "SUGGESTION")
         .length,
     },
-    findings: [...state.findings]
-      .sort(
-        (left, right) =>
-          SEVERITIES.indexOf(left.s) - SEVERITIES.indexOf(right.s),
-      )
-      .slice(0, 50),
-    observations: state.observations.slice(0, 20),
+    findings: state.findings.map((finding) => ({ ...finding })),
+    observations: state.observations.map((note) => ({ ...note })),
     fileCount: state.files.length,
-    files: state.files.slice(0, 150),
+    files: state.files.map((file) => ({ ...file })),
   };
-  return [snapshot, ...state.history.filter((item) => item.sha !== sha)].slice(
+  return [snapshot, ...state.history].slice(
     0,
     HISTORY_LIMIT,
   );
