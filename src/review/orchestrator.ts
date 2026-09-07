@@ -66,13 +66,12 @@ export async function runReview(
   // `@bot summary` just redraws the sticky comment from what we already know —
   // no diff, no model call, no tokens.
   if (opts.summaryOnly) {
-    await publishSummary(octokit, repo, pr, prev, engine.model);
+    await publishSummary(octokit, repo, pr, prev, prev.model || engine.model);
     core.info("Re-rendered the summary comment from stored state.");
     return;
   }
 
-  // A full review rebuilds the totals from scratch; that's the escape hatch if
-  // accumulation ever drifts.
+  // Previous findings are supplied only as context for incremental fix notes.
   let base: ReviewState = opts.forceFull
     ? { ...prev, findings: [], observations: [], files: [] }
     : prev;
@@ -80,12 +79,19 @@ export async function runReview(
   const scope = await resolveScope(octokit, repo, pr, prev, opts.forceFull);
   if (!scope.hasChanges) {
     core.info("No reviewable changes in scope. Nothing to do.");
+    const next = !opts.forceFull && prev.lastReviewedSha === pr.headSha
+      ? prev
+      : {
+          ...advance(prev, pr, EMPTY_USAGE, true, scope.kind),
+          findings: [], observations: [], files: [], assessment: "",
+          history: historyWithPrevious(prev),
+        };
     await publishSummary(
       octokit,
       repo,
       pr,
-      advance(base, pr, EMPTY_USAGE, false, scope.kind),
-      engine.model,
+      next,
+      prev.model || engine.model,
     );
     return;
   }
@@ -119,7 +125,11 @@ export async function runReview(
       new Map(dropped.map((d) => [d.path, d.reason as FileKind])),
       new Map(),
     );
-    const next = advance(base, pr, EMPTY_USAGE, false, scope.kind);
+    const next = advance(base, pr, EMPTY_USAGE, true, scope.kind);
+    next.findings = [];
+    next.observations = [];
+    next.assessment = "";
+    next.history = historyWithPrevious(prev);
     next.summarySha = pr.headSha;
     next.scope = scope.kind;
     next.files = roster;
@@ -156,7 +166,7 @@ export async function runReview(
   const reviewedFiles: DiffFile[] = [];
   const failedPaths = new Set<string>();
   let usage: TokenUsage = { ...EMPTY_USAGE };
-  let failed = 0;
+  const failedBatches = new Set<number>();
 
   for (const [i, batch] of batches.entries()) {
     const label =
@@ -174,9 +184,13 @@ export async function runReview(
       const draft = await engine.review(system, user);
       usage = addUsage(usage, draft.usage);
       partial = draft.result;
+      if (draft.incomplete) {
+        failedBatches.add(i);
+        for (const file of batch) failedPaths.add(file.path);
+      }
     } catch (err: any) {
       // One failed batch must not throw away the batches that succeeded.
-      failed++;
+      failedBatches.add(i);
       for (const file of batch) failedPaths.add(file.path);
       core.warning(`${label} failed to review (${err.message}); skipping it.`);
       continue;
@@ -198,6 +212,7 @@ export async function runReview(
           partial,
         );
         usage = addUsage(usage, verified.usage);
+        if (verified.incomplete) throw new Error("Verification response was incomplete");
         // The verify pass returns a whole fresh result, so anything the model
         // forgot to echo back would otherwise be silently lost.
         partial = {
@@ -217,6 +232,8 @@ export async function runReview(
               : partial.prior_finding_verdicts,
         };
       } catch (err: any) {
+        failedBatches.add(i);
+        for (const file of batch) failedPaths.add(file.path);
         core.warning(
           `${label}: verification pass failed (${err.message}); keeping draft.`,
         );
@@ -234,10 +251,9 @@ export async function runReview(
     partials.push(partial);
   }
 
+  const failed = failedBatches.size;
   if (partials.length === 0) {
-    throw new Error(
-      `All ${batches.length} review request(s) failed; leaving the PR untouched.`,
-    );
+    core.warning(`All ${batches.length} review request(s) failed; publishing an incomplete review.`);
   }
   if (failed > 0) {
     core.warning(
@@ -269,11 +285,11 @@ export async function runReview(
     repo,
     pull_number,
     pr.headSha,
-    reviewBody(reviewedFiles.length, pr.headSha, comments.length),
+    reviewBody(new Set(reviewedFiles.map((file) => file.path)).size, pr.headSha, comments.length),
     comments,
   );
 
-  /* ---- fold this run into the running totals ---- */
+  /* Each published block describes this pass only. Prior findings are context. */
 
   const reviewedPaths = new Set(reviewedFiles.map((f) => f.path));
   const freshFindings = result.findings
@@ -283,8 +299,8 @@ export async function runReview(
       return { ...stored, id: findingAliases.get(stored.id) ?? stored.id };
     });
 
-  const { findings, expired } = mergeFindings(
-    base.findings,
+  const { findings } = mergeFindings(
+    [],
     freshFindings,
     existing.byId,
     priorVerdicts,
@@ -295,7 +311,7 @@ export async function runReview(
     ...unanchored.map(findingToObservation),
   ];
   const observations = dropObservationsWithComments(
-    mergeObservations(base.observations, freshObservations, reviewedPaths),
+    mergeObservations([], freshObservations, reviewedPaths),
     findings,
   );
 
@@ -337,17 +353,15 @@ export async function runReview(
   next.observations = observations;
   next.files = roster;
   next.summarySha = pr.headSha;
-  if ((prev.summarySha ?? prev.lastReviewedSha) !== pr.headSha) {
-    next.history = historyWithPrevious(prev);
-  }
-  next.assessment = result.overall_assessment.trim() || base.assessment;
+  next.history = historyWithPrevious(prev);
+  next.assessment = result.overall_assessment.trim();
 
   await publishSummary(octokit, repo, pr, next, engine.model);
 
   core.info(
     `Done. ${comments.length} new comment(s), ${duplicates.length} duplicate(s) skipped, ` +
-      `${unanchored.length} demoted to observations, ${expired.length} resolved. ` +
-      `Totals: ${findings.length} open finding(s); this pass covered ${reviewedFiles.length} file(s)` +
+      `${unanchored.length} demoted to observations. ` +
+      `This pass: ${findings.length} finding(s) across ${reviewedPaths.size} file(s)` +
       (skippedByCap > 0 ? `; ${skippedByCap} file(s) over max_files` : "") +
       (failed > 0 ? `; ${failedPaths.size} file(s) queued for retry` : "") +
       ".",
@@ -355,11 +369,10 @@ export async function runReview(
 }
 
 /**
- * Fold per-batch results into one. Findings and observations concatenate — each
- * batch saw a disjoint set of files, so there is nothing to dedupe here;
- * `mergeFindings` handles identity against previous runs downstream.
+ * Fold chunks into one review. A file can span several chunks, so findings
+ * are deduplicated and conflicting prior verdicts are reconciled conservatively.
  */
-function mergeResults(partials: ReviewResult[]): ReviewResult {
+export function mergeResults(partials: ReviewResult[]): ReviewResult {
   if (partials.length === 1) return partials[0];
 
   const assessments = partials
@@ -368,13 +381,21 @@ function mergeResults(partials: ReviewResult[]): ReviewResult {
 
   return {
     overall_assessment: assessments.join(" "),
-    findings: partials.flatMap((p) => p.findings),
+    findings: [...new Map(partials.flatMap((p) => p.findings).map((f) => [findingId(f.path, f.title), f])).values()],
     observations: partials.flatMap((p) => p.observations),
     file_reviews: partials.flatMap((p) => p.file_reviews),
-    prior_finding_verdicts: partials.flatMap(
-      (p) => p.prior_finding_verdicts,
-    ),
+    prior_finding_verdicts: reconcileVerdicts(partials),
   };
+}
+
+function reconcileVerdicts(partials: ReviewResult[]): ReviewResult["prior_finding_verdicts"] {
+  const verdicts = new Map<string, ReviewResult["prior_finding_verdicts"][number]>();
+  const rank = { resolved: 0, unknown: 1, unresolved: 2 };
+  for (const verdict of partials.flatMap((p) => p.prior_finding_verdicts)) {
+    const previous = verdicts.get(verdict.id);
+    if (!previous || rank[verdict.status] > rank[previous.status]) verdicts.set(verdict.id, verdict);
+  }
+  return [...verdicts.values()];
 }
 
 function fileReviewsForBatch(
@@ -406,9 +427,10 @@ export function buildFileReviewNotes(
 ): Map<string, string> {
   const notes = new Map<string, string>();
   for (const review of reviews) {
-    if (!notes.has(review.path)) {
-      notes.set(review.path, flatten(review.summary));
-    }
+    const previous = notes.get(review.path);
+    const summary = flatten(review.summary);
+    if (!previous) notes.set(review.path, summary);
+    else if (!previous.includes(summary)) notes.set(review.path, `${previous}; ${summary}`);
   }
 
   const priorById = new Map(
@@ -540,7 +562,7 @@ export function advance(
     summarySha: counted ? pr.headSha : base.summarySha,
     scope: counted ? scope : base.scope,
     reviewCount: base.reviewCount + (counted ? 1 : 0),
-    usage: addUsage(base.usage, usage),
+    usage: counted ? usage : base.usage,
   };
 }
 

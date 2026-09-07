@@ -249,7 +249,7 @@ function build(
   const parts: string[] = [
     "## Code Review Summary",
     "",
-    renderStatusLine(counts),
+    renderPassStatus(counts, input.files),
   ];
   if (input.findings.length > 0) {
     parts.push("", renderOverviewTable(counts));
@@ -333,7 +333,7 @@ export function renderHistory(history: ReviewSnapshot[]): string {
       "<!-- kilo-review-history-entry -->",
       `### Previous review (commit ${snapshot.sha.slice(0, 7)})`,
       "",
-      renderStatusLine(counts),
+      renderPassStatus(counts, snapshot.files),
     );
     if (snapshot.findings.length > 0) {
       lines.push(
@@ -357,11 +357,25 @@ export function renderHistory(history: ReviewSnapshot[]): string {
       total: snapshot.fileCount,
     });
     if (roster) lines.push("", roster);
+    if (snapshot.scope === "full" && snapshot.assessment?.trim()) {
+      lines.push("", `**Overall Assessment:** ${snapshot.assessment.trim()}`);
+    }
+    if (snapshot.model) {
+      lines.push("", `<sub>${renderUsage(snapshot.model, snapshot.usage ?? { input: 0, output: 0, cached: 0 })}</sub>`);
+    }
     lines.push("");
   }
 
   lines.push("</details>", "<!-- /kilo-review-history -->");
   return lines.join("\n");
+}
+
+function renderPassStatus(counts: SeverityCounts, files: StoredFile[]): string {
+  if (files.some((file) => file.k === "failed" || file.k === "cap")) {
+    const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+    return `**Status:** Review Incomplete (${total} issues found so far) | **Recommendation:** Complete review before merge`;
+  }
+  return renderStatusLine(counts);
 }
 
 export function renderUsage(model: string, usage: TokenUsage): string {

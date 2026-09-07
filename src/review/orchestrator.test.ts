@@ -2,9 +2,11 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import { DiffFile } from "../github/diff";
 import { DEFAULT_STATE, ReviewState } from "../github/state";
+import { ReviewResultSchema } from "../types";
 import { ExistingComments } from "../github/review";
 import {
   advance,
+  mergeResults,
   buildFileReviewNotes,
   priorFindingAliases,
   priorFindingsForBatch,
@@ -24,6 +26,15 @@ const FILE: DiffFile = {
 };
 
 describe("incremental orchestration helpers", () => {
+  it("deduplicates findings across chunks and keeps conflicting resolutions conservative", () => {
+    const finding = { path: "a.ts", line: 2, severity: "WARNING", category: "bug", title: "Failure", summary: "Breaks", body: "Breaks here" };
+    const result = mergeResults([
+      ReviewResultSchema.parse({ findings: [finding], prior_finding_verdicts: [{ id: "old", status: "resolved", reason: "First chunk" }] }),
+      ReviewResultSchema.parse({ findings: [finding], prior_finding_verdicts: [{ id: "old", status: "unknown", reason: "Missing context" }] }),
+    ]);
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.prior_finding_verdicts[0].status, "unknown");
+  });
   it("selects prior findings for the batch and refreshes live lines", () => {
     const findings = [
       {

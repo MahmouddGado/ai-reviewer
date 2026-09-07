@@ -144,6 +144,7 @@ export function buildUserPrompt(
   );
   parts.push(`**Title:** ${meta.title}`);
   parts.push(`**Branch:** ${meta.headRef} → ${meta.baseRef}`);
+  parts.push("This is an independent review pass. Report only findings evidenced in the supplied changes. Previous findings are context for fix notes, not a list to carry into this review. If a prior issue is still evidenced here, report it explicitly in findings.");
   if (meta.description.trim()) {
     parts.push(`\n**Description:**\n${truncate(meta.description, 4000)}`);
   }
@@ -171,6 +172,7 @@ export function buildUserPrompt(
   );
   for (const f of diffFiles) {
     parts.push(`\n### ${f.path}`);
+    if (f.part) parts.push(`Part ${f.part.index}/${f.part.total} of this file. Review only this fragment; missing surrounding code is not evidence of a bug.`);
     parts.push("```diff");
     parts.push(f.rendered);
     parts.push("```");

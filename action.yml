@@ -1,5 +1,5 @@
 name: "AI Code Reviewer"
-description: "CodeRabbit-style AI reviews on every pull request and commit, powered by Claude"
+description: "Incremental, chunked pull request reviews powered by GLM-5.3"
 author: "MahmouddGado"
 branding:
   icon: "eye"
@@ -9,17 +9,20 @@ inputs:
     description: "z.ai API key (store as a secret). Legacy alias: anthropic_api_key."
     required: true
   base_url:
-    description: "Anthropic-compatible API base URL. Defaults to z.ai's endpoint."
+    description: "API base URL. Defaults to z.ai's Anthropic or Coding endpoint according to api_protocol."
     required: false
-    default: "https://api.z.ai/api/anthropic"
+  api_protocol:
+    description: "API protocol: anthropic or openai. Coding Plan accounts can use openai with the default Coding endpoint."
+    required: false
+    default: "anthropic"
   github_token:
     description: "GitHub token with pull-requests: write and issues: write"
     required: true
     default: ${{ github.token }}
   model:
-    description: "Model id (e.g. glm-5.2, glm-4.6). z.ai GLM via the Anthropic-compatible endpoint."
+    description: "Model id (e.g. glm-5.3). z.ai GLM via the Anthropic-compatible endpoint."
     required: false
-    default: "glm-5.2"
+    default: "glm-5.3"
   config_path:
     description: "Path to the .aireviewer.yaml config file in the repo"
     required: false
@@ -30,7 +33,7 @@ inputs:
     description: "Maximum files to review per run. 0 = no limit. Built-in default: 0 (review every changed file)."
     required: false
   batch_chars:
-    description: "Chars of diff per model request. Files are split across as many requests as needed; this never reduces how much is reviewed. Built-in default: 200000."
+    description: "Chars of diff and file headings per request. Oversized files split into chunks; prompts add overhead. Built-in default: 200000."
     required: false
   max_output_tokens:
     description: "Output token cap per model request. Raise if reviews look cut off. Built-in default: 32000."

@@ -36158,7 +36158,13 @@ function extractLegacyTitle(body) {
  *                   "Other Observations" in the summary.
  */
 function buildInlineComments(findings, diffFiles, existing, idAliases = new Map()) {
-    const byPath = new Map(diffFiles.map((f) => [f.path, f.commentableLines]));
+    const byPath = new Map();
+    for (const file of diffFiles) {
+        const lines = byPath.get(file.path) ?? new Set();
+        for (const line of file.commentableLines)
+            lines.add(line);
+        byPath.set(file.path, lines);
+    }
     const comments = [];
     const unanchored = [];
     const duplicates = [];
@@ -36354,7 +36360,6 @@ exports.readState = readState;
 exports.writeSummary = writeSummary;
 const core = __importStar(__nccwpck_require__(7484));
 const zlib_1 = __nccwpck_require__(3106);
-const types_1 = __nccwpck_require__(8522);
 exports.STATE_VERSION = 3;
 exports.HISTORY_LIMIT = 3;
 /** GitHub's hard cap on an issue-comment body. */
@@ -36442,6 +36447,9 @@ function historyWithPrevious(state) {
         return state.history;
     const snapshot = {
         sha,
+        assessment: state.assessment,
+        model: state.model,
+        usage: { ...state.usage },
         scope: state.scope,
         counts: {
             CRITICAL: state.findings.filter((finding) => finding.s === "CRITICAL")
@@ -36451,14 +36459,12 @@ function historyWithPrevious(state) {
             SUGGESTION: state.findings.filter((finding) => finding.s === "SUGGESTION")
                 .length,
         },
-        findings: [...state.findings]
-            .sort((left, right) => types_1.SEVERITIES.indexOf(left.s) - types_1.SEVERITIES.indexOf(right.s))
-            .slice(0, 50),
-        observations: state.observations.slice(0, 20),
+        findings: state.findings.map((finding) => ({ ...finding })),
+        observations: state.observations.map((note) => ({ ...note })),
         fileCount: state.files.length,
-        files: state.files.slice(0, 150),
+        files: state.files.map((file) => ({ ...file })),
     };
-    return [snapshot, ...state.history.filter((item) => item.sha !== sha)].slice(0, exports.HISTORY_LIMIT);
+    return [snapshot, ...state.history].slice(0, exports.HISTORY_LIMIT);
 }
 function migrateState(raw) {
     const legacyTokens = finite(raw?.tokens);
@@ -36600,8 +36606,11 @@ async function run() {
         if (!apiKey)
             throw new Error("Input required and not supplied: api_key");
         const token = core.getInput("github_token", { required: true });
-        const model = core.getInput("model") || "glm-5.2";
-        const baseUrl = core.getInput("base_url") || "https://api.z.ai/api/anthropic";
+        const model = core.getInput("model") || "glm-5.3";
+        const protocol = core.getInput("api_protocol") || "anthropic";
+        if (protocol !== "anthropic" && protocol !== "openai")
+            throw new Error("api_protocol must be anthropic or openai");
+        const baseUrl = core.getInput("base_url") || (protocol === "openai" ? "https://api.z.ai/api/coding/paas/v4" : "https://api.z.ai/api/anthropic");
         const configPath = core.getInput("config_path") || ".aireviewer.yaml";
         // An unset input is "", which must stay undefined so .aireviewer.yaml wins.
         // Note Number("") === 0, and 0 is a meaningful max_files, so the emptiness
@@ -36624,7 +36633,7 @@ async function run() {
         const octokit = (0, client_1.makeOctokit)(token);
         const ctx = github.context;
         const repo = { owner: ctx.repo.owner, repo: ctx.repo.repo };
-        const engine = new engine_1.ReviewEngine(apiKey, model, baseUrl, intInput("max_output_tokens"));
+        const engine = new engine_1.ReviewEngine(apiKey, model, baseUrl, intInput("max_output_tokens"), protocol);
         const pull_number = await resolvePrNumber(octokit, repo, ctx);
         if (!pull_number) {
             core.info("Event is not associated with a pull request. Skipping.");
@@ -36867,88 +36876,74 @@ function clamp(s, max) {
 /***/ }),
 
 /***/ 7048:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+/***/ ((__unused_webpack_module, exports) => {
 
 "use strict";
 
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.planBatches = planBatches;
-const core = __importStar(__nccwpck_require__(7484));
-/**
- * Splitting exists so `max_files: 0` (unlimited) is actually usable: a 300-file
- * PR cannot go into one request, but it can go into eight. Nothing is ever
- * dropped or truncated here — a file too big for a whole batch still gets its
- * own batch and is sent in full.
- */
+/** Pack whole files when possible; oversized diffs are split without dropping text. */
 function planBatches(files, charBudget) {
-    if (files.length === 0)
-        return [];
     if (!Number.isFinite(charBudget) || charBudget <= 0)
-        return [files];
+        return files.length ? [files] : [];
     const batches = [];
     let current = [];
     let size = 0;
-    for (const f of files) {
-        const cost = fileCost(f);
-        // A single file over budget goes alone rather than being cut down.
-        if (cost >= charBudget) {
-            if (current.length) {
+    for (const file of files) {
+        for (const part of splitFile(file, charBudget)) {
+            const cost = part.rendered.length + part.path.length + 128;
+            if (current.length && size + cost > charBudget) {
                 batches.push(current);
                 current = [];
                 size = 0;
             }
-            batches.push([f]);
-            core.info(`${f.path} is ${f.rendered.length} chars — reviewing it in a batch of its own.`);
-            continue;
+            current.push(part);
+            size += cost;
         }
-        if (current.length && size + cost > charBudget) {
-            batches.push(current);
-            current = [];
-            size = 0;
-        }
-        current.push(f);
-        size += cost;
     }
     if (current.length)
         batches.push(current);
     return batches;
 }
-/** Rendered diff plus the per-file heading/fence overhead `buildUserPrompt` adds. */
-function fileCost(f) {
-    return f.rendered.length + f.path.length + 32;
+function splitFile(file, budget) {
+    const available = budget - file.path.length - 128;
+    if (available < 64)
+        throw new Error(`batch_chars is too small for ${file.path}; increase the budget.`);
+    if (file.rendered.length <= available)
+        return [file];
+    // Prefer hunk boundaries, then line boundaries. Even a single very long line
+    // is retained across parts; only visible numbered lines may anchor findings.
+    const pieces = [];
+    let current = "";
+    const flush = () => { if (current)
+        pieces.push(current); current = ""; };
+    for (const hunk of file.rendered.split(/(?=^@@ )/m)) {
+        if (hunk.length <= available) {
+            if (current.length + hunk.length > available)
+                flush();
+            current += hunk;
+            continue;
+        }
+        flush();
+        for (const line of hunk.match(/[^\n]*\n|[^\n]+$/g) ?? []) {
+            if (current.length + line.length > available)
+                flush();
+            let rest = line;
+            while (rest.length > available) {
+                pieces.push(rest.slice(0, available));
+                rest = rest.slice(available);
+            }
+            current += rest;
+        }
+    }
+    flush();
+    return pieces.map((rendered, index) => ({
+        ...file,
+        rendered,
+        part: { index: index + 1, total: pieces.length },
+        commentableLines: new Set([...rendered.matchAll(/^\s*(\d+) [ +] /gm)]
+            .map((match) => Number(match[1])).filter((line) => file.commentableLines.has(line))),
+    }));
 }
 
 
@@ -37162,6 +37157,7 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.ReviewEngine = void 0;
 const core = __importStar(__nccwpck_require__(7484));
 const sdk_1 = __importDefault(__nccwpck_require__(121));
+const openai_1 = __nccwpck_require__(5012);
 const types_1 = __nccwpck_require__(8522);
 const TOOL_NAME = "submit_review";
 /**
@@ -37171,11 +37167,17 @@ const TOOL_NAME = "submit_review";
  */
 const DEFAULT_MAX_TOKENS = 32000;
 class ReviewEngine {
+    apiKey;
     model;
+    baseURL;
+    protocol;
     client;
     maxTokens;
-    constructor(apiKey, model, baseURL, maxTokens) {
+    constructor(apiKey, model, baseURL, maxTokens, protocol = "anthropic") {
+        this.apiKey = apiKey;
         this.model = model;
+        this.baseURL = baseURL;
+        this.protocol = protocol;
         // baseURL points the Anthropic SDK at z.ai's Anthropic-compatible endpoint
         // (https://api.z.ai/api/anthropic) so GLM models work with no code changes.
         this.client = new sdk_1.default({ apiKey, ...(baseURL ? { baseURL } : {}) });
@@ -37213,35 +37215,37 @@ class ReviewEngine {
         ]);
     }
     async call(system, messages) {
-        const response = await this.client.messages.create({
-            model: this.model,
-            max_tokens: this.maxTokens,
-            system,
-            tools: [
-                {
-                    name: TOOL_NAME,
-                    description: "Submit the structured code review, including prior-finding reconciliation when prior findings were supplied.",
-                    input_schema: types_1.REVIEW_TOOL_SCHEMA,
-                },
-            ],
-            tool_choice: { type: "tool", name: TOOL_NAME },
-            messages,
-        });
+        const response = this.protocol === "openai"
+            ? await (0, openai_1.callOpenAI)(this.apiKey, this.baseURL ?? "https://api.z.ai/api/coding/paas/v4", this.model, this.maxTokens, system, messages)
+            : await this.client.messages.create({
+                model: this.model,
+                max_tokens: this.maxTokens,
+                system,
+                tools: [
+                    {
+                        name: TOOL_NAME,
+                        description: "Submit the structured code review, including prior-finding reconciliation when prior findings were supplied.",
+                        input_schema: types_1.REVIEW_TOOL_SCHEMA,
+                    },
+                ],
+                tool_choice: this.model === "glm-5.3" ? { type: "auto" } : { type: "tool", name: TOOL_NAME },
+                messages,
+            });
         const usage = readUsage(response);
         if (response.stop_reason === "max_tokens") {
             core.warning(`Model hit the ${this.maxTokens}-token output cap; this batch's review may be incomplete. Consider lowering batch_chars so each request carries fewer files.`);
         }
-        const toolUse = response.content.find((c) => c.type === "tool_use");
+        const toolUse = response.content.find((c) => c.type === "tool_use" && c.name === TOOL_NAME);
         if (!toolUse) {
             throw new Error("Model did not return a submit_review tool call.");
         }
         const parsed = types_1.ReviewResultSchema.safeParse(toolUse.input);
         if (parsed.success)
-            return { result: parsed.data, usage };
+            return { result: parsed.data, usage, incomplete: response.stop_reason === "max_tokens" };
         core.warning(`Model output failed validation: ${parsed.error.issues
             .map((i) => i.message)
             .join("; ")}`);
-        return { result: salvage(toolUse.input), usage };
+        return { result: salvage(toolUse.input), usage, incomplete: true };
     }
 }
 exports.ReviewEngine = ReviewEngine;
@@ -37299,6 +37303,72 @@ function num(v) {
 
 /***/ }),
 
+/***/ 5012:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.callOpenAI = callOpenAI;
+const types_1 = __nccwpck_require__(8522);
+/** OpenAI-compatible transport for z.ai accounts restricted to the Coding endpoint. */
+async function callOpenAI(apiKey, baseURL, model, maxTokens, system, messages) {
+    const converted = [{ role: "system", content: system }];
+    for (const message of messages) {
+        if (typeof message.content === "string") {
+            converted.push({ role: message.role, content: message.content });
+            continue;
+        }
+        for (const block of message.content) {
+            if (block.type === "tool_use") {
+                converted.push({ role: "assistant", content: null, tool_calls: [{
+                            id: block.id, type: "function",
+                            function: { name: block.name, arguments: JSON.stringify(block.input) },
+                        }] });
+            }
+            else if (block.type === "tool_result") {
+                converted.push({ role: "tool", tool_call_id: block.tool_use_id, content: block.content });
+            }
+            else if (block.type === "text") {
+                converted.push({ role: message.role, content: block.text });
+            }
+        }
+    }
+    const response = await fetch(`${baseURL.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(600000),
+        body: JSON.stringify({
+            model, max_tokens: maxTokens, messages: converted,
+            tools: [{ type: "function", function: { name: "submit_review", description: "Submit the structured review", parameters: types_1.REVIEW_TOOL_SCHEMA } }],
+            tool_choice: "auto",
+        }),
+    });
+    if (!response.ok)
+        throw new Error(`Model API returned HTTP ${response.status}; check the API key, model access, and base_url.`);
+    const data = await response.json();
+    const choice = data.choices?.[0];
+    const content = (choice?.message?.tool_calls ?? []).map((call) => ({
+        type: "tool_use", id: call.id, name: call.function.name, input: JSON.parse(call.function.arguments),
+    }));
+    const cached = data.usage?.prompt_tokens_details?.cached_tokens ?? 0;
+    const usage = {
+        input_tokens: Math.max(0, (data.usage?.prompt_tokens ?? 0) - cached),
+        output_tokens: data.usage?.completion_tokens ?? 0,
+        cache_read_input_tokens: cached,
+        cache_creation_input_tokens: 0,
+    };
+    return {
+        id: "openai-review", type: "message", role: "assistant", model, content,
+        stop_reason: choice?.finish_reason === "length" ? "max_tokens" : "tool_use",
+        stop_sequence: null,
+        usage,
+    };
+}
+
+
+/***/ }),
+
 /***/ 6222:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -37339,6 +37409,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.runReview = runReview;
+exports.mergeResults = mergeResults;
 exports.buildFileReviewNotes = buildFileReviewNotes;
 exports.priorFindingsForBatch = priorFindingsForBatch;
 exports.withoutPaths = withoutPaths;
@@ -37362,19 +37433,25 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
     // `@bot summary` just redraws the sticky comment from what we already know —
     // no diff, no model call, no tokens.
     if (opts.summaryOnly) {
-        await publishSummary(octokit, repo, pr, prev, engine.model);
+        await publishSummary(octokit, repo, pr, prev, prev.model || engine.model);
         core.info("Re-rendered the summary comment from stored state.");
         return;
     }
-    // A full review rebuilds the totals from scratch; that's the escape hatch if
-    // accumulation ever drifts.
+    // Previous findings are supplied only as context for incremental fix notes.
     let base = opts.forceFull
         ? { ...prev, findings: [], observations: [], files: [] }
         : prev;
     const scope = await (0, scope_1.resolveScope)(octokit, repo, pr, prev, opts.forceFull);
     if (!scope.hasChanges) {
         core.info("No reviewable changes in scope. Nothing to do.");
-        await publishSummary(octokit, repo, pr, advance(base, pr, EMPTY_USAGE, false, scope.kind), engine.model);
+        const next = !opts.forceFull && prev.lastReviewedSha === pr.headSha
+            ? prev
+            : {
+                ...advance(prev, pr, EMPTY_USAGE, true, scope.kind),
+                findings: [], observations: [], files: [], assessment: "",
+                history: (0, state_1.historyWithPrevious)(prev),
+            };
+        await publishSummary(octokit, repo, pr, next, prev.model || engine.model);
         return;
     }
     const allFiles = (0, diff_1.parseDiffFiles)(scope.diffText);
@@ -37395,7 +37472,11 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
     if (files.length === 0) {
         core.info("All changed files were filtered out. Nothing to review.");
         const roster = (0, render_1.buildRoster)(allFiles.map((f) => f.path), new Map(dropped.map((d) => [d.path, d.reason])), new Map());
-        const next = advance(base, pr, EMPTY_USAGE, false, scope.kind);
+        const next = advance(base, pr, EMPTY_USAGE, true, scope.kind);
+        next.findings = [];
+        next.observations = [];
+        next.assessment = "";
+        next.history = (0, state_1.historyWithPrevious)(prev);
         next.summarySha = pr.headSha;
         next.scope = scope.kind;
         next.files = roster;
@@ -37426,7 +37507,7 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
     const reviewedFiles = [];
     const failedPaths = new Set();
     let usage = { ...EMPTY_USAGE };
-    let failed = 0;
+    const failedBatches = new Set();
     for (const [i, batch] of batches.entries()) {
         const label = batches.length > 1
             ? `Batch ${i + 1}/${batches.length} (${batch.length} file(s))`
@@ -37441,10 +37522,15 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
             const draft = await engine.review(system, user);
             usage = addUsage(usage, draft.usage);
             partial = draft.result;
+            if (draft.incomplete) {
+                failedBatches.add(i);
+                for (const file of batch)
+                    failedPaths.add(file.path);
+            }
         }
         catch (err) {
             // One failed batch must not throw away the batches that succeeded.
-            failed++;
+            failedBatches.add(i);
             for (const file of batch)
                 failedPaths.add(file.path);
             core.warning(`${label} failed to review (${err.message}); skipping it.`);
@@ -37458,6 +37544,8 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
             try {
                 const verified = await engine.verify((0, prompts_1.verificationPrompt)(), user, partial);
                 usage = addUsage(usage, verified.usage);
+                if (verified.incomplete)
+                    throw new Error("Verification response was incomplete");
                 // The verify pass returns a whole fresh result, so anything the model
                 // forgot to echo back would otherwise be silently lost.
                 partial = {
@@ -37476,6 +37564,9 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
                 };
             }
             catch (err) {
+                failedBatches.add(i);
+                for (const file of batch)
+                    failedPaths.add(file.path);
                 core.warning(`${label}: verification pass failed (${err.message}); keeping draft.`);
             }
         }
@@ -37488,8 +37579,9 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
         suppliedPriorFindings.push(...priorFindings);
         partials.push(partial);
     }
+    const failed = failedBatches.size;
     if (partials.length === 0) {
-        throw new Error(`All ${batches.length} review request(s) failed; leaving the PR untouched.`);
+        core.warning(`All ${batches.length} review request(s) failed; publishing an incomplete review.`);
     }
     if (failed > 0) {
         core.warning(`${failed} of ${batches.length} batch(es) failed; the report covers the rest.`);
@@ -37499,8 +37591,8 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
     const priorVerdicts = result.prior_finding_verdicts.filter((verdict) => suppliedPriorIds.has(verdict.id));
     const findingAliases = priorFindingAliases(result.findings, suppliedPriorFindings);
     const { comments, unanchored, duplicates } = (0, review_1.buildInlineComments)(result.findings, reviewedFiles, existing, findingAliases);
-    await (0, review_1.postReview)(octokit, repo, pull_number, pr.headSha, reviewBody(reviewedFiles.length, pr.headSha, comments.length), comments);
-    /* ---- fold this run into the running totals ---- */
+    await (0, review_1.postReview)(octokit, repo, pull_number, pr.headSha, reviewBody(new Set(reviewedFiles.map((file) => file.path)).size, pr.headSha, comments.length), comments);
+    /* Each published block describes this pass only. Prior findings are context. */
     const reviewedPaths = new Set(reviewedFiles.map((f) => f.path));
     const freshFindings = result.findings
         .filter((finding) => !unanchored.includes(finding))
@@ -37508,12 +37600,12 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
         const stored = (0, accumulate_1.toStoredFinding)(finding);
         return { ...stored, id: findingAliases.get(stored.id) ?? stored.id };
     });
-    const { findings, expired } = (0, accumulate_1.mergeFindings)(base.findings, freshFindings, existing.byId, priorVerdicts);
+    const { findings } = (0, accumulate_1.mergeFindings)([], freshFindings, existing.byId, priorVerdicts);
     const freshObservations = [
         ...result.observations.map(accumulate_1.toStoredObservation),
         ...unanchored.map(accumulate_1.findingToObservation),
     ];
-    const observations = (0, accumulate_1.dropObservationsWithComments)((0, accumulate_1.mergeObservations)(base.observations, freshObservations, reviewedPaths), findings);
+    const observations = (0, accumulate_1.dropObservationsWithComments)((0, accumulate_1.mergeObservations)([], freshObservations, reviewedPaths), findings);
     const issueCounts = new Map();
     for (const f of findings) {
         if (reviewedPaths.has(f.p)) {
@@ -37530,22 +37622,19 @@ async function runReview(octokit, repo, pull_number, config, engine, opts) {
     next.observations = observations;
     next.files = roster;
     next.summarySha = pr.headSha;
-    if ((prev.summarySha ?? prev.lastReviewedSha) !== pr.headSha) {
-        next.history = (0, state_1.historyWithPrevious)(prev);
-    }
-    next.assessment = result.overall_assessment.trim() || base.assessment;
+    next.history = (0, state_1.historyWithPrevious)(prev);
+    next.assessment = result.overall_assessment.trim();
     await publishSummary(octokit, repo, pr, next, engine.model);
     core.info(`Done. ${comments.length} new comment(s), ${duplicates.length} duplicate(s) skipped, ` +
-        `${unanchored.length} demoted to observations, ${expired.length} resolved. ` +
-        `Totals: ${findings.length} open finding(s); this pass covered ${reviewedFiles.length} file(s)` +
+        `${unanchored.length} demoted to observations. ` +
+        `This pass: ${findings.length} finding(s) across ${reviewedPaths.size} file(s)` +
         (skippedByCap > 0 ? `; ${skippedByCap} file(s) over max_files` : "") +
         (failed > 0 ? `; ${failedPaths.size} file(s) queued for retry` : "") +
         ".");
 }
 /**
- * Fold per-batch results into one. Findings and observations concatenate — each
- * batch saw a disjoint set of files, so there is nothing to dedupe here;
- * `mergeFindings` handles identity against previous runs downstream.
+ * Fold chunks into one review. A file can span several chunks, so findings
+ * are deduplicated and conflicting prior verdicts are reconciled conservatively.
  */
 function mergeResults(partials) {
     if (partials.length === 1)
@@ -37555,11 +37644,21 @@ function mergeResults(partials) {
         .filter((a) => a.length > 0);
     return {
         overall_assessment: assessments.join(" "),
-        findings: partials.flatMap((p) => p.findings),
+        findings: [...new Map(partials.flatMap((p) => p.findings).map((f) => [(0, review_1.findingId)(f.path, f.title), f])).values()],
         observations: partials.flatMap((p) => p.observations),
         file_reviews: partials.flatMap((p) => p.file_reviews),
-        prior_finding_verdicts: partials.flatMap((p) => p.prior_finding_verdicts),
+        prior_finding_verdicts: reconcileVerdicts(partials),
     };
+}
+function reconcileVerdicts(partials) {
+    const verdicts = new Map();
+    const rank = { resolved: 0, unknown: 1, unresolved: 2 };
+    for (const verdict of partials.flatMap((p) => p.prior_finding_verdicts)) {
+        const previous = verdicts.get(verdict.id);
+        if (!previous || rank[verdict.status] > rank[previous.status])
+            verdicts.set(verdict.id, verdict);
+    }
+    return [...verdicts.values()];
 }
 function fileReviewsForBatch(reviews, batch) {
     const allowed = new Set(batch.map((file) => file.path));
@@ -37579,9 +37678,12 @@ function fileReviewsForBatch(reviews, batch) {
 function buildFileReviewNotes(reviews, verdicts, priorFindings, issueCounts) {
     const notes = new Map();
     for (const review of reviews) {
-        if (!notes.has(review.path)) {
-            notes.set(review.path, flatten(review.summary));
-        }
+        const previous = notes.get(review.path);
+        const summary = flatten(review.summary);
+        if (!previous)
+            notes.set(review.path, summary);
+        else if (!previous.includes(summary))
+            notes.set(review.path, `${previous}; ${summary}`);
     }
     const priorById = new Map(priorFindings.map((finding) => [finding.id, finding]));
     for (const verdict of verdicts) {
@@ -37686,7 +37788,7 @@ function advance(base, pr, usage, counted, scope, advanceCheckpoint = true) {
         summarySha: counted ? pr.headSha : base.summarySha,
         scope: counted ? scope : base.scope,
         reviewCount: base.reviewCount + (counted ? 1 : 0),
-        usage: addUsage(base.usage, usage),
+        usage: counted ? usage : base.usage,
     };
 }
 /**
@@ -37852,6 +37954,7 @@ function buildUserPrompt(meta, diffFiles, config, priorFindings = []) {
     parts.push(`## Pull request${meta.incremental ? " (incremental — only new changes since last review are shown)" : ""}`);
     parts.push(`**Title:** ${meta.title}`);
     parts.push(`**Branch:** ${meta.headRef} → ${meta.baseRef}`);
+    parts.push("This is an independent review pass. Report only findings evidenced in the supplied changes. Previous findings are context for fix notes, not a list to carry into this review. If a prior issue is still evidenced here, report it explicitly in findings.");
     if (meta.description.trim()) {
         parts.push(`\n**Description:**\n${truncate(meta.description, 4000)}`);
     }
@@ -37873,6 +37976,8 @@ function buildUserPrompt(meta, diffFiles, config, priorFindings = []) {
     parts.push("Lines are prefixed with their NEW-file line number. `+` = added, ` ` = context, `-` = removed (no new line number).");
     for (const f of diffFiles) {
         parts.push(`\n### ${f.path}`);
+        if (f.part)
+            parts.push(`Part ${f.part.index}/${f.part.total} of this file. Review only this fragment; missing surrounding code is not evidence of a bug.`);
         parts.push("```diff");
         parts.push(f.rendered);
         parts.push("```");
@@ -38104,7 +38209,7 @@ function build(input, degradation) {
     const parts = [
         "## Code Review Summary",
         "",
-        renderStatusLine(counts),
+        renderPassStatus(counts, input.files),
     ];
     if (input.findings.length > 0) {
         parts.push("", renderOverviewTable(counts));
@@ -38172,7 +38277,7 @@ function renderHistory(history) {
     for (const snapshot of history) {
         const counts = snapshot.counts ?? countBySeverity(snapshot.findings);
         const findingCount = Object.values(counts).reduce((sum, count) => sum + count, 0);
-        lines.push("<!-- kilo-review-history-entry -->", `### Previous review (commit ${snapshot.sha.slice(0, 7)})`, "", renderStatusLine(counts));
+        lines.push("<!-- kilo-review-history-entry -->", `### Previous review (commit ${snapshot.sha.slice(0, 7)})`, "", renderPassStatus(counts, snapshot.files));
         if (snapshot.findings.length > 0) {
             lines.push("", renderOverviewTable(counts), "", renderIssueDetails(snapshot.findings));
             if (findingCount > snapshot.findings.length) {
@@ -38189,10 +38294,23 @@ function renderHistory(history) {
         });
         if (roster)
             lines.push("", roster);
+        if (snapshot.scope === "full" && snapshot.assessment?.trim()) {
+            lines.push("", `**Overall Assessment:** ${snapshot.assessment.trim()}`);
+        }
+        if (snapshot.model) {
+            lines.push("", `<sub>${renderUsage(snapshot.model, snapshot.usage ?? { input: 0, output: 0, cached: 0 })}</sub>`);
+        }
         lines.push("");
     }
     lines.push("</details>", "<!-- /kilo-review-history -->");
     return lines.join("\n");
+}
+function renderPassStatus(counts, files) {
+    if (files.some((file) => file.k === "failed" || file.k === "cap")) {
+        const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+        return `**Status:** Review Incomplete (${total} issues found so far) | **Recommendation:** Complete review before merge`;
+    }
+    return renderStatusLine(counts);
 }
 function renderUsage(model, usage) {
     if (usage.input + usage.output + usage.cached === 0) {
@@ -38290,6 +38408,9 @@ const diff_1 = __nccwpck_require__(4032);
  *  - otherwise                                                          → lastReviewedSha...head
  */
 async function resolveScope(octokit, repo, pr, state, forceFull) {
+    if (!forceFull && state.lastReviewedSha === pr.headSha) {
+        return { kind: state.scope, base: pr.headSha, head: pr.headSha, diffText: "", hasChanges: false };
+    }
     const canIncrement = !forceFull &&
         state.lastReviewedSha &&
         state.lastReviewedSha !== pr.headSha;

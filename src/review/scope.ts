@@ -24,6 +24,9 @@ export async function resolveScope(
   state: ReviewState,
   forceFull: boolean,
 ): Promise<ReviewScope> {
+  if (!forceFull && state.lastReviewedSha === pr.headSha) {
+    return { kind: state.scope, base: pr.headSha, head: pr.headSha, diffText: "", hasChanges: false };
+  }
   const canIncrement =
     !forceFull &&
     state.lastReviewedSha &&
