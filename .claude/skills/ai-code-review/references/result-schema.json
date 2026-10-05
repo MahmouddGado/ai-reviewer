@@ -1,0 +1,69 @@
+{
+  "$comment": "Same contract as the Action's submit_review tool (src/types.ts REVIEW_TOOL_SCHEMA). Write one object per batch to batch-N.draft.json (review) and batch-N.result.json (verification). Add \"incomplete\": true if you could not finish the batch; finalize then marks its files for retry.",
+  "type": "object",
+  "required": ["overall_assessment", "findings", "file_reviews", "prior_finding_verdicts"],
+  "properties": {
+    "overall_assessment": {
+      "type": "string",
+      "description": "2-5 sentences judging the change as a whole: name the patterns it introduces, say whether the design is sound, and end by characterising what the issues (if any) amount to."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Line-anchored review findings. Empty if the code is clean.",
+      "items": {
+        "type": "object",
+        "required": ["path", "line", "severity", "category", "title", "summary", "body"],
+        "properties": {
+          "path": { "type": "string", "description": "Repo-relative file path, exactly as in the batch's ### heading." },
+          "line": { "type": "integer", "description": "Line number in the NEW file (the number printed before the diff line). Must be a + or context line shown in the diff." },
+          "end_line": { "type": "integer", "description": "Last line of a multi-line finding. Omit for single-line findings." },
+          "severity": { "enum": ["CRITICAL", "WARNING", "SUGGESTION"] },
+          "category": { "enum": ["bug", "security", "performance", "style", "test", "docs", "other"] },
+          "title": { "type": "string", "description": "Short noun-phrase label, at most ~8 words, e.g. 'Missing `on SessionExpiredException` handler'. Not a sentence." },
+          "summary": { "type": "string", "description": "One line naming the problem AND its consequence. Rendered in a markdown table cell: no newlines, no |." },
+          "body": { "type": "string", "description": "3-6 sentences, one paragraph. Name the concrete symbols, trace the failure path step by step, state the consequence. Contrast with sibling code when the issue is an inconsistency." },
+          "suggestion": { "type": "string", "description": "Optional. Replacement code for lines [line..end_line], no fences. Only for mechanical fixes you are confident compile." }
+        }
+      }
+    },
+    "observations": {
+      "type": "array",
+      "description": "Real issues in surrounding/unchanged code NOT anchored to a changed line. Never repeat a finding here.",
+      "items": {
+        "type": "object",
+        "required": ["path", "note"],
+        "properties": {
+          "path": { "type": "string" },
+          "line": { "type": "integer" },
+          "note": { "type": "string", "description": "What you noticed and why it matters. One paragraph; rendered in a table cell." }
+        }
+      }
+    },
+    "file_reviews": {
+      "type": "array",
+      "description": "Exactly one entry for every file in this batch, including clean files and tests.",
+      "items": {
+        "type": "object",
+        "required": ["path", "summary"],
+        "properties": {
+          "path": { "type": "string" },
+          "summary": { "type": "string", "maxLength": 1000, "description": "Start with 'clean;' when the file has no surviving finding, then concrete evidence (behaviour changed, prior finding fixed, regression a test pins). Never 'looks good'." }
+        }
+      }
+    },
+    "prior_finding_verdicts": {
+      "type": "array",
+      "description": "One verdict for every previous finding supplied in the prompt. Empty when none were supplied.",
+      "items": {
+        "type": "object",
+        "required": ["id", "status", "reason"],
+        "properties": {
+          "id": { "type": "string", "description": "The exact opaque id from the previous-findings section." },
+          "status": { "enum": ["resolved", "unresolved", "unknown"] },
+          "reason": { "type": "string", "maxLength": 1000, "description": "One sentence citing the visible evidence." }
+        }
+      }
+    },
+    "incomplete": { "type": "boolean" }
+  }
+}
