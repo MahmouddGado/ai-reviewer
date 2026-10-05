@@ -89,6 +89,22 @@ Inline comments:
 See `../coderabbit-clone-usage.md` (English) or `../coderabbit-clone-usage-ar.md` (Arabic) for the
 full usage guide.
 
+## Claude Code skill and routine
+
+`.claude/skills/ai-code-review/` runs this same harness with Claude as the reviewer — no API
+key or workflow needed. Claude does the review and verification passes; `scripts/air.mjs`
+(a zero-dependency port of the diff, chunking, dedup, rendering, and state code) produces
+output byte-identical to the Action's, and both share the sticky comment's state marker.
+
+```
+/ai-code-review <owner/repo> [pr-number ... | all] [--full] [--profile quiet|chill|assertive] [--dry-run]
+```
+
+To review automatically, create a Claude Code Routine (claude.ai/code → Routines) whose prompt
+runs `/ai-code-review <owner/repo> all` on a schedule; each run reviews new commits on every
+open PR incrementally and skips PRs whose head was already reviewed.
+See `.claude/skills/ai-code-review/references/harness.md` for how every step works.
+
 ## Development
 
 ```bash
